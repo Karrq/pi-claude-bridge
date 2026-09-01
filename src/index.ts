@@ -1,7 +1,7 @@
 import { calculateCost, StringEnum, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import * as piAi from "@earendil-works/pi-ai";
 import { getApiProvider, getModels, registerApiProvider, unregisterApiProviders } from "@earendil-works/pi-ai/compat";
-import { buildSessionContext, compact, generateBranchSummary, keyHint, type BranchSummaryResult, type CompactionEntry, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, compact, generateBranchSummary, getAgentDir, keyHint, type BranchSummaryResult, type CompactionEntry, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Type } from "typebox";
@@ -26,6 +26,7 @@ import {
 import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachment } from "./attachments.js";
 import { createToolServer } from "./mcp-server.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
+import { startDebugCaptureProxy } from "./debug-capture-proxy.js";
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
@@ -155,6 +156,19 @@ const ACTIVE_STREAM_SIMPLE_KEY = Symbol.for("claude-bridge:activeStreamSimple");
 // that skipped registration must not be able to unregister the parent's.
 const API_PROVIDER_SOURCE_ID = `claude-bridge:${moduleInstanceId}`;
 let registeredApiProvider = false;
+
+// Same first-instance-wins pattern as ACTIVE_STREAM_SIMPLE_KEY: one proxy per pi
+// process, shared by every module instance (parent and subagents alike), closed
+// only by the instance that started it. `env` is mutated in place once the OS
+// hands back a port — spawn sites read it fresh via getDebugProxyEnv() rather
+// than caching it, so they see the real ANTHROPIC_BASE_URL even if a query
+// starts before the listener is up.
+const DEBUG_CAPTURE_PROXY_KEY = Symbol.for("claude-bridge:debugCaptureProxy");
+
+function getDebugProxyEnv(): Record<string, string> {
+	const entry = (globalThis as Record<symbol, any>)[DEBUG_CAPTURE_PROXY_KEY];
+	return entry?.env ?? {};
+}
 
 // Claude Code's own builtin tools, for the AskClaude path where CC really runs
 // them. The provider path never sees these — it starts CC with `tools: []`.
@@ -489,7 +503,7 @@ async function runIsolatedSummary(
 			prompt: promptText,
 			options: {
 				cwd,
-				env: { ...process.env, ...CC_CHILD_ENV },
+				env: { ...process.env, ...CC_CHILD_ENV, ...getDebugProxyEnv() },
 				settings: { autoMemoryEnabled: false },
 				tools: [],
 				strictMcpConfig: true,
@@ -1731,7 +1745,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// also autocompact would double-flush the prompt cache and races pi's
 	// threshold with CC's, including CC's anti-thrashing guard (issue #8).
 	// Manual /compact in CC still works (we never invoke it).
-	const childEnv = { ...process.env, ...CC_CHILD_ENV };
+	const childEnv = { ...process.env, ...CC_CHILD_ENV, ...getDebugProxyEnv() };
 	const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 		cwd,
 		env: childEnv,
@@ -1986,7 +2000,7 @@ async function promptAndWait(
 		prompt,
 		options: {
 			cwd,
-			env: { ...process.env, ...CC_CHILD_ENV },
+			env: { ...process.env, ...CC_CHILD_ENV, ...getDebugProxyEnv() },
 			permissionMode: "bypassPermissions",
 			settings: { ...claudeCodeSettings(providerSettings), claudeMdExcludes: CLAUDE_MD_EXCLUDES },
 			skills: [],
@@ -2117,6 +2131,23 @@ export default function (pi: ExtensionAPI) {
 		if (config.askClaude?.enabled === undefined) pendingNotices.push("The AskClaude tool is opt-in only. Set askClaude.enabled to use it.");
 	}
 
+	if (providerSettings.debugCaptureProxy?.enabled) {
+		const g = globalThis as Record<symbol, any>;
+		if (!g[DEBUG_CAPTURE_PROXY_KEY]) {
+			const outDir = providerSettings.debugCaptureProxy.outDir
+				?? join(getAgentDir(), "claude-bridge-captures", `${new Date().toISOString().replace(/[:.]/g, "-")}-${moduleInstanceId}`);
+			const env: Record<string, string> = {};
+			const proxy = startDebugCaptureProxy(outDir, (url) => {
+				env.ANTHROPIC_BASE_URL = url;
+				debug(`debugCaptureProxy: listening at ${url}, recording to ${outDir}`);
+			});
+			g[DEBUG_CAPTURE_PROXY_KEY] = { ownerModuleInstanceId: moduleInstanceId, proxy, env, warned: false };
+			debug(`debugCaptureProxy: starting (owner=${moduleInstanceId}), recording to ${outDir}`);
+		} else {
+			debug(`debugCaptureProxy: already running (owner=${g[DEBUG_CAPTURE_PROXY_KEY].ownerModuleInstanceId}), reusing`);
+		}
+	}
+
 	// Reset shared session on pi session lifecycle events
 	const clearSession = (event: string) => {
 		debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
@@ -2136,6 +2167,14 @@ export default function (pi: ExtensionAPI) {
 		piMode = ctx.mode;
 		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
 			clearSession(`session_start:${event.reason}`);
+		}
+		// Fires once per process (not once ever, unlike showStartupNoticeOnce): this
+		// is an active recording of conversation content, not a missed-default tip,
+		// so it should reappear every time the setting is actually on.
+		const proxyEntry = (globalThis as Record<symbol, any>)[DEBUG_CAPTURE_PROXY_KEY];
+		if (proxyEntry && !proxyEntry.warned && piMode === "tui") {
+			proxyEntry.warned = true;
+			piUI?.notify(`claude-bridge: recording full conversation content to ${proxyEntry.proxy.outDir} (provider.debugCaptureProxy is enabled)`, "warning");
 		}
 	});
 	// `--system-prompt` replaces pi's default rather than adding to it, but Claude
@@ -2160,6 +2199,13 @@ export default function (pi: ExtensionAPI) {
 			unregisterApiProviders(API_PROVIDER_SOURCE_ID);
 			registeredApiProvider = false;
 			debug("side request: unregistered api provider");
+		}
+		const g = globalThis as Record<symbol, any>;
+		const proxyEntry = g[DEBUG_CAPTURE_PROXY_KEY];
+		if (proxyEntry?.ownerModuleInstanceId === moduleInstanceId) {
+			debug(`debugCaptureProxy: shutting down (owner=${moduleInstanceId})`);
+			proxyEntry.proxy.close();
+			g[DEBUG_CAPTURE_PROXY_KEY] = undefined;
 		}
 	});
 

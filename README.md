@@ -67,7 +67,8 @@ Config: `~/.pi/agent/claude-bridge.json` (global) or the project Pi config direc
     "plan": "max",
     "longContextExtraUsage": false,
     "strictMcpConfig": true,
-    "pathToClaudeCodeExecutable": "/home/you/.nix-profile/bin/claude"
+    "pathToClaudeCodeExecutable": "/home/you/.nix-profile/bin/claude",
+    "debugCaptureProxy": { "enabled": false }
   },
   "compaction": {
     "takeover": true
@@ -94,6 +95,7 @@ Config: `~/.pi/agent/claude-bridge.json` (global) or the project Pi config direc
 - `strictMcpConfig` — block MCP servers from `~/.claude.json` / `.mcp.json` (default `true`). Cloud MCP (Gmail/Drive via claude.ai OAuth) is always blocked.
 - `autoMemoryEnabled` — enable Claude Code's auto-memory system (default `false`)
 - `pathToClaudeCodeExecutable` — path to the `claude` binary. Useful if your OS/filesystem has the SDK's bundled musl/glibc binaries in a place where they can't run. For example, with Nix you can set the binary to e.g. `"/home/you/.nix-profile/bin/claude"`.
+- `debugCaptureProxy` — `{ enabled: false, outDir?: string }`. When enabled, records every Claude Code child's outbound API request/response (bodies, `cache_control` placement, token usage) to `outDir` (default `<agent dir>/claude-bridge-captures/<timestamp>-<id>`) for debugging prompt-cache behavior. Off by default, and shows a TUI warning every session it's on — a capture contains full conversation content, written to disk unencrypted.
 
 `compaction`:
 - `takeover` (default `true`) — answer `session_before_compact` and run pi's `compact()` through an isolated Claude Code subprocess (no tools, no skills, single turn, `persistSession: false`). This only changes the *transport* of the summarization call: the preparation, prompt and summary format are pi's own.

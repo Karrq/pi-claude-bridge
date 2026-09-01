@@ -63,6 +63,10 @@ function usageFromSse(text) {
 			input: usage.input_tokens ?? 0,
 			cacheRead: usage.cache_read_input_tokens ?? 0,
 			cacheWrite: usage.cache_creation_input_tokens ?? 0,
+			// Undefined (not 0) when cache_creation is absent from the response,
+			// which distinguishes "wrote 0 to the 1h bucket" from "no TTL breakdown at all".
+			cacheWrite1h: usage.cache_creation?.ephemeral_1h_input_tokens,
+			cacheWrite5m: usage.cache_creation?.ephemeral_5m_input_tokens,
 		};
 	} catch {
 		return null;

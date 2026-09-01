@@ -32,6 +32,17 @@ export interface Config {
 		// Anthropic billing). Enables Sonnet 4.6 [1m] on every plan and Opus 4.6
 		// [1m] on Pro.
 		longContextExtraUsage?: boolean;
+		// In-process MITM proxy recording every Claude Code child's outbound API
+		// traffic (request bodies, cache_control placement, usage) for debugging
+		// prompt-cache behavior. Off by default — a capture writes full
+		// conversation content to disk unencrypted, and the extension warns once
+		// per process when it's on. See diag/AUDIT.md and diag/capture-proxy.mjs,
+		// which src/debug-capture-proxy.ts mirrors.
+		debugCaptureProxy?: {
+			enabled?: boolean;
+			// Defaults to <agent dir>/claude-bridge-captures/<timestamp>-<instance id>.
+			outDir?: string;
+		};
 	};
 	compaction?: {
 		// When true (default), the extension answers session_before_compact and
