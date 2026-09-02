@@ -171,6 +171,20 @@ function getDebugProxyEnv(): Record<string, string> {
 	return entry?.env ?? {};
 }
 
+// Warns once per process, the first time a claude-bridge model is actually
+// active — not on every session_start regardless of model, since most
+// sessions never spawn a CC child at all and would never be captured.
+// Checked again on model_select for a session that starts on another
+// provider and switches into claude-bridge later.
+function warnDebugCaptureProxyIfNeeded(model: Model<any> | undefined): void {
+	if (model?.baseUrl !== "claude-bridge") return;
+	const proxyEntry = (globalThis as Record<symbol, any>)[DEBUG_CAPTURE_PROXY_KEY];
+	if (proxyEntry && !proxyEntry.warned && piMode === "tui") {
+		proxyEntry.warned = true;
+		piUI?.notify(`claude-bridge: recording full conversation content to ${proxyEntry.proxy.outDir} (provider.debugCaptureProxy is enabled)`, "warning");
+	}
+}
+
 // Claude Code's own builtin tools, for the AskClaude path where CC really runs
 // them. The provider path never sees these — it starts CC with `tools: []`.
 const SDK_TO_PI_TOOL_NAME: Record<string, string> = {
@@ -882,6 +896,10 @@ export const __test = {
 	setPiUI(ui: ExtensionUIContext | null) {
 		piUI = ui;
 	},
+	setPiMode(mode: ExtensionContext["mode"] | null) {
+		piMode = mode;
+	},
+	warnDebugCaptureProxyIfNeeded,
 	syncSharedSession,
 	claimLease,
 	releaseHeldLease,
@@ -2291,14 +2309,7 @@ export default function (pi: ExtensionAPI) {
 				debug(`session_start:${event.reason}: ${recovered ? "lease unavailable, discarding recovered pointer" : "no recoverable session"}, clean start`);
 			}
 		}
-		// Fires once per process (not once ever, unlike showStartupNoticeOnce): this
-		// is an active recording of conversation content, not a missed-default tip,
-		// so it should reappear every time the setting is actually on.
-		const proxyEntry = (globalThis as Record<symbol, any>)[DEBUG_CAPTURE_PROXY_KEY];
-		if (proxyEntry && !proxyEntry.warned && piMode === "tui") {
-			proxyEntry.warned = true;
-			piUI?.notify(`claude-bridge: recording full conversation content to ${proxyEntry.proxy.outDir} (provider.debugCaptureProxy is enabled)`, "warning");
-		}
+		warnDebugCaptureProxyIfNeeded(ctx.model);
 	});
 	// `--system-prompt` replaces pi's default rather than adding to it, but Claude
 	// Code's preset carries its own tool and permission guidance that the bridge
@@ -2312,6 +2323,9 @@ export default function (pi: ExtensionAPI) {
 			contextFiles: options?.contextFiles ?? [],
 			skills: hasRead ? options?.skills ?? [] : [],
 		});
+	});
+	pi.on("model_select", (event) => {
+		warnDebugCaptureProxyIfNeeded(event.model);
 	});
 	pi.on("session_shutdown", () => {
 		reportLeaks("session_shutdown");
