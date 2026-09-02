@@ -4,10 +4,10 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createSession, deleteSession, openSession } from "cc-session-io";
+import { createSession, deleteSession, getSessionPath, openSession } from "cc-session-io";
 
 const { __test } = await import("../src/index.js");
 
@@ -15,6 +15,7 @@ describe("syncSharedSession", () => {
 	afterEach(() => {
 		__test.resetSharedSession();
 		__test.setPiUI(null);
+		__test.releaseHeldLease();
 	});
 
 	// The branch this exercises is the guard that stops a reentrant subagent from
@@ -104,5 +105,100 @@ describe("syncSharedSession", () => {
 			deleteSession(sessionId, cwd);
 			rmSync(cwd, { recursive: true, force: true });
 		}
+	});
+
+	// A sibling process (e.g. a /fork resuming shared history) can hold the
+	// previous session's lease. Rebuilding must not delete or overwrite a file
+	// someone else might still be writing to — it has to rotate to a fresh id
+	// instead of preserving the old one.
+	it("rotates to a fresh session id instead of preserving when the old id's lease is held elsewhere", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "sync-shared-session-"));
+		const sessionId = randomUUID();
+		try {
+			const seeded = createSession({ sessionId, projectPath: cwd });
+			seeded.importMessages([{ role: "user", content: "Hello" }]);
+			seeded.save();
+
+			// Simulate a live foreign holder: pid 1 (init/launchd) is always alive.
+			const lockPath = `${getSessionPath(sessionId, cwd)}.lock`;
+			writeFileSync(lockPath, JSON.stringify({ pid: 1, ownerId: "sibling", updatedAt: new Date().toISOString() }));
+
+			// cursor: 0 so priorMessages (2 msgs) counts as fully "missed" rather than a
+			// trailing-assistant continuation, routing into REBUILD instead of REUSE.
+			__test.setSharedSession({ sessionId, cursor: 0, cwd });
+			const result = __test.syncSharedSession([
+				{ role: "user", content: "Hello", timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "Hi." }], timestamp: Date.now() },
+				{ role: "user", content: "More.", timestamp: Date.now() },
+			], cwd);
+
+			assert.notEqual(result.sessionId, sessionId, "must not preserve an id whose lease is held elsewhere");
+			assert.equal(existsSync(getSessionPath(sessionId, cwd)), true, "the still-locked file must not be deleted out from under its holder");
+			assert.equal(existsSync(getSessionPath(result.sessionId, cwd)), true);
+		} finally {
+			deleteSession(sessionId, cwd);
+			if (__test.getSharedSession()) deleteSession(__test.getSharedSession().sessionId, cwd);
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("claims the lease for a freshly rebuilt session id", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "sync-shared-session-"));
+		try {
+			const result = __test.syncSharedSession([
+				{ role: "user", content: "Hello", timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "Hi." }], timestamp: Date.now() },
+				{ role: "user", content: "More.", timestamp: Date.now() },
+			], cwd);
+
+			assert.equal(__test.getHeldLease()?.sessionId, result.sessionId);
+			assert.equal(existsSync(`${getSessionPath(result.sessionId, cwd)}.lock`), true);
+		} finally {
+			const held = __test.getSharedSession();
+			if (held) deleteSession(held.sessionId, cwd);
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("recoverSharedSessionFromEntries", () => {
+	afterEach(() => {
+		__test.resetSharedSession();
+		__test.releaseHeldLease();
+	});
+
+	function fakeSessionManager(entries) {
+		return { getBranch: () => entries };
+	}
+
+	it("returns null when no custom entry of our type exists", () => {
+		const recovered = __test.recoverSharedSessionFromEntries(fakeSessionManager([
+			{ type: "message", id: "1", parentId: null, timestamp: "t" },
+		]), "/some/cwd");
+		assert.equal(recovered, null);
+	});
+
+	it("recovers the latest custom entry's sessionId and cursor", () => {
+		const recovered = __test.recoverSharedSessionFromEntries(fakeSessionManager([
+			{ type: "custom", id: "1", parentId: null, timestamp: "t", customType: "claude-bridge:cc-session", data: { sessionId: "old-id", cursor: 2 } },
+			{ type: "message", id: "2", parentId: "1", timestamp: "t" },
+			{ type: "custom", id: "3", parentId: "2", timestamp: "t", customType: "claude-bridge:cc-session", data: { sessionId: "new-id", cursor: 4 } },
+		]), "/some/cwd");
+		assert.deepEqual(recovered, { sessionId: "new-id", cursor: 4, cwd: "/some/cwd", needsRebuild: false });
+	});
+
+	it("marks needsRebuild when a compaction happened after the last recorded pointer", () => {
+		const recovered = __test.recoverSharedSessionFromEntries(fakeSessionManager([
+			{ type: "custom", id: "1", parentId: null, timestamp: "t", customType: "claude-bridge:cc-session", data: { sessionId: "old-id", cursor: 2 } },
+			{ type: "compaction", id: "2", parentId: "1", timestamp: "t", summary: "...", firstKeptEntryId: "1", tokensBefore: 100 },
+		]), "/some/cwd");
+		assert.deepEqual(recovered, { sessionId: "old-id", cursor: 2, cwd: "/some/cwd", needsRebuild: true });
+	});
+
+	it("ignores entries from a customType we don't own", () => {
+		const recovered = __test.recoverSharedSessionFromEntries(fakeSessionManager([
+			{ type: "custom", id: "1", parentId: null, timestamp: "t", customType: "some-other-extension", data: { sessionId: "nope", cursor: 99 } },
+		]), "/some/cwd");
+		assert.equal(recovered, null);
 	});
 });

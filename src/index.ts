@@ -1,12 +1,12 @@
 import { calculateCost, StringEnum, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import * as piAi from "@earendil-works/pi-ai";
 import { getApiProvider, getModels, registerApiProvider, unregisterApiProviders } from "@earendil-works/pi-ai/compat";
-import { buildSessionContext, compact, generateBranchSummary, getAgentDir, keyHint, type BranchSummaryResult, type CompactionEntry, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, compact, generateBranchSummary, getAgentDir, keyHint, type BranchSummaryResult, type CompactionEntry, type CustomEntry, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
-import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
+import { createSession, deleteSession, getSessionPath, openSession, repairToolPairing } from "cc-session-io";
 import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
@@ -27,6 +27,7 @@ import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachm
 import { createToolServer } from "./mcp-server.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 import { startDebugCaptureProxy } from "./debug-capture-proxy.js";
+import { acquireOrRefreshLease, releaseLease } from "./session-lease.js";
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
@@ -268,6 +269,70 @@ function readCarriedAttachments(sessionId: string, cwd: string): CarriedAttachme
 }
 
 let sharedSession: SessionState | null = null;
+
+// Custom entry persisted into pi's own session file so a fresh module
+// instance (/reload, or a second pi process sharing history via /fork) can
+// recover the CC session pointer instead of unconditionally starting over.
+// See recoverSharedSessionFromEntries and claimLease.
+const CC_SESSION_ENTRY_TYPE = "claude-bridge:cc-session";
+
+function sessionLockPath(sessionId: string, cwd: string): string {
+	return `${getSessionPath(sessionId, cwd, process.env.CLAUDE_CONFIG_DIR)}.lock`;
+}
+
+// The one CC session (if any) this process currently holds the lease for.
+// Mirrors sharedSession.sessionId; tracked separately so a move to a
+// different sessionId can release the old lease before claiming the new one.
+let heldLease: { sessionId: string; cwd: string } | null = null;
+
+/**
+ * Claim (or refresh) the lease for `sessionId`. Returns false if a different,
+ * live process already holds it — callers must not write to that session's
+ * JSONL in that case.
+ */
+function claimLease(sessionId: string, cwd: string): boolean {
+	const ok = acquireOrRefreshLease(sessionLockPath(sessionId, cwd), moduleInstanceId);
+	if (ok && heldLease?.sessionId !== sessionId) {
+		if (heldLease) releaseLease(sessionLockPath(heldLease.sessionId, heldLease.cwd));
+		heldLease = { sessionId, cwd };
+	}
+	return ok;
+}
+
+function releaseHeldLease(): void {
+	if (heldLease) {
+		releaseLease(sessionLockPath(heldLease.sessionId, heldLease.cwd));
+		heldLease = null;
+	}
+}
+
+/**
+ * Recover a persisted CC session pointer from pi's own session history, for
+ * a fresh module instance (/reload, /fork) to resume instead of rebuilding.
+ * Branch-scoped (walks from the current leaf), so a fork or tree navigation
+ * to an unrelated point never recovers a pointer that belongs only to a
+ * divergent branch.
+ *
+ * If a compaction happened after the last recorded pointer, the recovered
+ * state is marked needsRebuild: the cursor it carries can no longer be
+ * trusted against pi's (now shorter) rewritten history — same as the live
+ * in-memory case session_compact already forces via markRebuild.
+ */
+function recoverSharedSessionFromEntries(sessionManager: ExtensionContext["sessionManager"], cwd: string): SessionState | null {
+	let lastEntry: CustomEntry<{ sessionId?: string; cursor?: number }> | null = null;
+	let compactionAfter = false;
+	for (const entry of sessionManager.getBranch()) {
+		if (entry.type === "custom" && entry.customType === CC_SESSION_ENTRY_TYPE) {
+			lastEntry = entry as CustomEntry<{ sessionId?: string; cursor?: number }>;
+			compactionAfter = false;
+		} else if (entry.type === "compaction" && lastEntry) {
+			compactionAfter = true;
+		}
+	}
+	const data = lastEntry?.data;
+	if (!data?.sessionId || typeof data.cursor !== "number") return null;
+	return { sessionId: data.sessionId, cursor: data.cursor, cwd, needsRebuild: compactionAfter };
+}
 
 // Convert pi messages to Anthropic API format for session import.
 // Lossy: only text, thinking and toolCall blocks survive, and thinking only when
@@ -691,6 +756,7 @@ function syncSharedSession(
 		if (missed.length === 0 || trailingAssistantOnly) {
 			if (trailingAssistantOnly) {
 				sharedSession = { ...sharedSession, cursor: priorMessages.length, cwd };
+				extensionApi?.appendEntry(CC_SESSION_ENTRY_TYPE, { sessionId: sharedSession.sessionId, cursor: sharedSession.cursor });
 			}
 			debug(`Case 3: ${trailingAssistantOnly ? "advanced cursor past trailing assistant, " : ""}resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
 			debug(`syncResult: path=reuse sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
@@ -727,9 +793,17 @@ function syncSharedSession(
 	const previousCursor = sharedSession?.cursor ?? 0;
 	// preserveId: rebuild in place (deleteSession + createSession with the
 	// existing UUID), so prompt-cache UUIDs stay stable for log correlation
-	// and for any tools that key off them. Skipped only when there's a
-	// concurrent writer we shouldn't race — see forceRotate docs above.
-	const preserveId = previousSessionId !== undefined && !sharedSession?.forceRotate;
+	// and for any tools that key off them. Skipped when there's a concurrent
+	// writer we shouldn't race — either our own post-abort orphan-write race
+	// (forceRotate, see docs above) or another live process holding the lease
+	// (e.g. a sibling /fork that recovered the same pointer first).
+	let preserveId = previousSessionId !== undefined && !sharedSession?.forceRotate;
+	let rotateReason: "post-abort" | "lease-conflict" | undefined = sharedSession?.forceRotate ? "post-abort" : undefined;
+	if (preserveId && !claimLease(previousSessionId!, cwd)) {
+		preserveId = false;
+		rotateReason = "lease-conflict";
+		debug(`Case 4: session ${previousSessionId!.slice(0, 8)}'s lease is held by another live process, rotating instead of preserving`);
+	}
 	// Before deleteSession — it wipes the file these live in.
 	const carried = previousSessionId !== undefined ? readCarriedAttachments(previousSessionId, cwd) : [];
 	if (preserveId) {
@@ -747,17 +821,24 @@ function syncSharedSession(
 	// records, not messages: `messages` filters out the attachment records that
 	// carrying an `@file` expansion across a rebuild writes into the same file.
 	verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, cwd);
+	// Should always succeed here: preserved ids were already verified above, and a
+	// freshly minted UUID can't collide with an existing lease. Proceed regardless —
+	// we've already written the file, there's no more "back off" option at this point.
+	if (!claimLease(session.sessionId, cwd)) {
+		debug(`WARNING: could not claim lease for session ${session.sessionId.slice(0, 8)} right after writing it`);
+	}
 	sharedSession = { sessionId: session.sessionId, cursor: priorMessages.length, cwd };
+	extensionApi?.appendEntry(CC_SESSION_ENTRY_TYPE, { sessionId: session.sessionId, cursor: priorMessages.length });
 	if (previousSessionId === undefined) {
 		debug(`Case 2: first turn with ${priorMessages.length} prior messages → session ${session.sessionId.slice(0, 8)}, ${session.records.length} records`);
 	} else if (preserveId) {
 		const missedCount = priorMessages.length - previousCursor;
 		debug(`Case 4: ${missedCount} missed messages, ${priorMessages.length} total → rewrote session ${session.sessionId.slice(0, 8)} (same id), ${session.records.length} records`);
 	} else {
-		debug(`Case 4 post-abort: ${priorMessages.length} total → new session ${session.sessionId.slice(0, 8)} (was ${previousSessionId.slice(0, 8)}, rotated to avoid race with orphan writer), ${session.records.length} records`);
+		debug(`Case 4 rotated (${rotateReason}): ${priorMessages.length} total → new session ${session.sessionId.slice(0, 8)} (was ${previousSessionId!.slice(0, 8)}), ${session.records.length} records`);
 	}
 	debugSessionPaths(`${session.sessionId.slice(0, 8)}`, cwd, session.jsonlPath);
-	debug(`syncResult: path=rebuild sessionId=${session.sessionId} priors=${priorMessages.length} ${previousSessionId === undefined ? "first" : preserveId ? "preserved" : "rotated-post-abort"}`);
+	debug(`syncResult: path=rebuild sessionId=${session.sessionId} priors=${priorMessages.length} ${previousSessionId === undefined ? "first" : preserveId ? "preserved" : rotateReason === "lease-conflict" ? "rotated-lease-conflict" : "rotated-post-abort"}`);
 	return { sessionId: session.sessionId };
 }
 
@@ -802,6 +883,16 @@ export const __test = {
 		piUI = ui;
 	},
 	syncSharedSession,
+	claimLease,
+	releaseHeldLease,
+	sessionLockPath,
+	recoverSharedSessionFromEntries,
+	getHeldLease() {
+		return heldLease;
+	},
+	setExtensionApi(api: ExtensionAPI | null) {
+		extensionApi = api;
+	},
 	buildSideRequestSession,
 	extractUserPromptBlocks,
 	consumeQuery,
@@ -872,6 +963,7 @@ function mapToolArgs(
 // Global (not query state):
 let piUI: ExtensionUIContext | null = null;
 let piMode: ExtensionContext["mode"] | null = null;
+let extensionApi: ExtensionAPI | null = null;
 const activeQueryContexts = new Set<QueryContext>();
 
 // Defaults that silently cost the user something (no Opus 1M on Max, no
@@ -1849,6 +1941,14 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				const cursor = Math.max(context.messages.length, queryCtx.latestCursor, sharedSession?.cursor ?? 0);
 				debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}`);
 				sharedSession = { sessionId, cursor, cwd };
+				// The only unconditional post-turn checkpoint: a brand-new conversation's
+				// first turn (syncSharedSession's clean-start path, sessionId: null) never
+				// touches syncSharedSession's own REUSE/REBUILD persistence below — CC mints
+				// the id itself and it's only captured here, after the turn completes.
+				if (!claimLease(sessionId, cwd)) {
+					debug(`WARNING: could not claim lease for session ${sessionId.slice(0, 8)} right after a completed turn`);
+				}
+				extensionApi?.appendEntry(CC_SESSION_ENTRY_TYPE, { sessionId, cursor });
 			}
 
 			if (!isReentrant && queryCtx.activeQuery === sdkQuery) {
@@ -2113,6 +2213,7 @@ const PREVIEW_MAX_LINES = 6;
 let askClaudeToolName = "AskClaude";
 
 export default function (pi: ExtensionAPI) {
+	extensionApi = pi;
 	// Disable non-essential Claude Code traffic (update checks, MCP registry, telemetry)
 	process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
 
@@ -2149,10 +2250,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// Reset shared session on pi session lifecycle events
-	const clearSession = (event: string) => {
-		debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
-		sharedSession = null;
-
+	const clearActiveStreamKey = (event: string) => {
 		// Clear the global streamSimple if this instance registered it.
 		// This allows /reload to work — the old instance clears the flag so
 		// the new instance can register fresh without wrapping stale state.
@@ -2162,11 +2260,36 @@ export default function (pi: ExtensionAPI) {
 			g[ACTIVE_STREAM_SIMPLE_KEY] = undefined;
 		}
 	};
+	const clearSession = (event: string) => {
+		debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
+		sharedSession = null;
+		clearActiveStreamKey(event);
+	};
 	pi.on("session_start", (event, ctx) => {
 		piUI = ctx.ui;
 		piMode = ctx.mode;
-		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
+		if (event.reason === "new") {
 			clearSession(`session_start:${event.reason}`);
+		} else if (event.reason === "resume" || event.reason === "fork" || event.reason === "startup") {
+			// "startup" covers a fresh CLI process pointed at an id that already has
+			// history on disk (--resume, --session-id, a second terminal) — empirically
+			// confirmed pi does not use "resume" for that, only for the in-process
+			// /reload handoff. "reload" (a distinct, unconfirmed reason) is left alone:
+			// no live evidence for when it fires, and overwriting an in-memory
+			// forceRotate flag with a recovered pointer that never sets one would
+			// reopen the post-abort orphan-write race forceRotate exists to avoid.
+			//
+			// Unrelated to CC-session recovery below — always needs to run so a fresh
+			// module instance can re-register the streaming provider.
+			clearActiveStreamKey(`session_start:${event.reason}`);
+			const recovered = recoverSharedSessionFromEntries(ctx.sessionManager, ctx.cwd);
+			if (recovered && claimLease(recovered.sessionId, recovered.cwd)) {
+				sharedSession = recovered;
+				debug(`session_start:${event.reason}: recovered session ${recovered.sessionId.slice(0, 8)}, cursor=${recovered.cursor}${recovered.needsRebuild ? " (needsRebuild: compaction seen since)" : ""}`);
+			} else {
+				sharedSession = null;
+				debug(`session_start:${event.reason}: ${recovered ? "lease unavailable, discarding recovered pointer" : "no recoverable session"}, clean start`);
+			}
 		}
 		// Fires once per process (not once ever, unlike showStartupNoticeOnce): this
 		// is an active recording of conversation content, not a missed-default tip,
@@ -2193,6 +2316,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => {
 		reportLeaks("session_shutdown");
 		clearSession("session_shutdown");
+		releaseHeldLease();
 		// Not in clearSession: that also runs on session_start, and a live session
 		// still needs to be able to serve side requests.
 		if (registeredApiProvider) {
