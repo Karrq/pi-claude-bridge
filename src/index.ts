@@ -2033,6 +2033,105 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	return stream;
 }
 
+// --- WebSearch: single-shot search executor ---
+
+// Only WebSearch is reachable — no filesystem/exec/skills, no mcpServers.
+const WEBSEARCH_ALLOWED_TOOLS = ["WebSearch"];
+
+const WEBSEARCH_SYSTEM_PROMPT = "You are a search executor. Call the WebSearch tool exactly once with the exact query given, then stop. Do not write any other text before or after the tool call. Do not answer from your own knowledge under any circumstances, even if you already know the answer — you must search.";
+
+interface WebSearchOutcome {
+	result?: string;
+	sources?: string[];
+	memoryAnswer?: string;
+}
+
+async function performWebSearch(searchQuery: string, modelId: string, signal?: AbortSignal): Promise<WebSearchOutcome> {
+	const cwd = process.cwd();
+	const model = resolveModel(modelId);
+	const cliModel = model ? claudeCodeModelId(model, longContextSettings) : modelId;
+	const claudeExecutable = providerSettings.pathToClaudeCodeExecutable;
+
+	const sdkQuery = query({
+		prompt: `Query: ${searchQuery}`,
+		options: {
+			cwd,
+			env: { ...process.env, ...CC_CHILD_ENV, ...getDebugProxyEnv() },
+			permissionMode: "bypassPermissions",
+			tools: WEBSEARCH_ALLOWED_TOOLS,
+			skills: [],
+			systemPrompt: WEBSEARCH_SYSTEM_PROMPT,
+			settingSources: [],
+			persistSession: false,
+			extraArgs: { model: cliModel, "strict-mcp-config": null },
+			...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
+			...makeCliDebugOptions("websearch"),
+		},
+	});
+
+	let wasAborted = false;
+	const onAbort = () => {
+		wasAborted = true;
+		sdkQuery.interrupt().catch(() => { try { sdkQuery.close(); } catch {} });
+	};
+	if (signal?.aborted) { onAbort(); throw new Error("Aborted"); }
+	signal?.addEventListener("abort", onAbort, { once: true });
+
+	try {
+		for await (const message of sdkQuery) {
+			if (wasAborted) break;
+			// CC's WebSearch is a client-side tool, not an API server tool: the search
+			// runs inside CC and its output lands as an ordinary tool_result on a
+			// user-role message (a string already containing links + a synthesized,
+			// cited answer) — not a web_search_tool_result content block on the
+			// assistant message, which is how the API's own server-side tool works.
+			if (message.type === "user") {
+				const blocks = (message as any).message?.content ?? [];
+				const toolResult = blocks.find((b: any) => b.type === "tool_result");
+				if (toolResult) {
+					// Stop as soon as the search lands — no need for the model to spend
+					// tokens narrating a second summary of a result that's already one.
+					void sdkQuery.interrupt().catch(() => {});
+					const content = toolResult.content;
+					const text = typeof content === "string"
+						? content
+						: (content ?? []).filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n");
+					if (toolResult.is_error) throw new Error(`WebSearch failed: ${text}`);
+					// CC's synthesized result embeds `Links: [{"title":...,"url":...}, ...]` ahead
+					// of its narrative answer — the same links it cites inline in that answer.
+					const linksMatch = text.match(/Links: (\[[\s\S]*?\])\n\n/);
+					let sources: string[] | undefined;
+					if (linksMatch) {
+						try {
+							sources = (JSON.parse(linksMatch[1]) as Array<{ url: string }>)
+								.map((l) => { try { return new URL(l.url).hostname.replace(/^www\./, ""); } catch { return null; } })
+								.filter((h): h is string => h !== null);
+						} catch {}
+					}
+					return { result: text, sources };
+				}
+			}
+			if (message.type === "assistant") {
+				const blocks = (message as any).message?.content ?? [];
+				const textBlock = blocks.find((b: any) => b.type === "text" && b.text?.trim());
+				if (textBlock) {
+					// Model answered from memory instead of calling the tool — surface the
+					// text as a tool error so the caller sees it failed to search and retries.
+					return { memoryAnswer: textBlock.text };
+				}
+			}
+			if (message.type === "result") {
+				const failure = wasAborted ? undefined : resultErrorText(message);
+				if (failure) throw new Error(failure);
+			}
+		}
+		return {};
+	} finally {
+		signal?.removeEventListener("abort", onAbort);
+		sdkQuery.close();
+	}
+}
+
 // --- AskClaude: prompt and wait ---
 
 async function promptAndWait(
@@ -2615,6 +2714,66 @@ export default function (pi: ExtensionAPI) {
 					return {
 						content: [{ type: "text" as const, text: `Error: ${msg}` }],
 						details: { prompt: params.prompt, executionTime: Date.now() - start, error: true },
+					};
+				}
+			},
+		});
+	}
+
+	// --- WebSearch tool ---
+
+	const webSearchConf = config.webSearch;
+	if (webSearchConf?.enabled) {
+		const webSearchDefaultModel = webSearchConf.model ?? "haiku";
+		const webSearchParams = Type.Object({
+			query: Type.String({ description: "The exact search query to run." }),
+		});
+		pi.registerTool<typeof webSearchParams>({
+			name: webSearchConf.name ?? "WebSearch",
+			label: webSearchConf.label ?? "Web Search",
+			description: webSearchConf.description ?? "Search the web. Returns a markdown-formatted answer with inline citation links to the sources used.",
+			parameters: webSearchParams,
+			renderCall(args, theme) {
+				return new Text(`${theme.fg("mdLink", theme.bold("WebSearch "))}${theme.fg("muted", `"${args.query}"`)}`, 0, 0);
+			},
+			renderResult(result, { expanded, isPartial }, theme) {
+				if (isPartial) return new Text(theme.fg("mdLink", "◉ Searching…"), 0, 0);
+				const body = result.content[0]?.type === "text" ? result.content[0].text : "";
+				const details = result.details as { error?: boolean; sources?: string[] } | undefined;
+				if (details?.error) return new Text(theme.fg("error", body), 0, 0);
+				if (!expanded) {
+					const sources = details?.sources ?? [];
+					const unique = [...new Set(sources)];
+					const summary = unique.length
+						? `${unique.length} result${unique.length === 1 ? "" : "s"} — ${unique.slice(0, 3).join(", ")}${unique.length > 3 ? ` +${unique.length - 3}` : ""}`
+						: "Done";
+					return new Text(theme.fg("muted", summary), 0, 0);
+				}
+				return new Text(theme.fg("toolOutput", body), 0, 0);
+			},
+			async execute(_id, params, signal) {
+				try {
+					const outcome = await performWebSearch(params.query, webSearchDefaultModel, signal);
+					if (outcome.memoryAnswer) {
+						return {
+							content: [{ type: "text" as const, text: `Error: search was not executed — the model answered from memory instead of calling WebSearch: ${outcome.memoryAnswer}` }],
+							details: { error: true },
+						};
+					}
+					if (!outcome.result) {
+						return {
+							content: [{ type: "text" as const, text: "Error: no search was executed and no answer was returned." }],
+							details: { error: true },
+						};
+					}
+					return {
+						content: [{ type: "text" as const, text: outcome.result }],
+						details: { sources: outcome.sources },
+					};
+				} catch (err) {
+					return {
+						content: [{ type: "text" as const, text: `Error: ${errorMessage(err)}` }],
+						details: { error: true },
 					};
 				}
 			},

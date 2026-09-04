@@ -21,6 +21,15 @@ export interface Config {
 		allowFullMode?: boolean;
 		appendSkills?: boolean;
 	};
+	webSearch?: {
+		enabled?: boolean;
+		name?: string;
+		label?: string;
+		description?: string;
+		// Model that executes the search. Defaults to "haiku" — its only job is
+		// calling the WebSearch tool once, so a small model is cheap and sufficient.
+		model?: string;
+	};
 	/** Low-level Claude Agent SDK plumbing. Most users won't need these. */
 	provider?: {
 		strictMcpConfig?: boolean;
@@ -113,5 +122,6 @@ export function loadConfig(cwd: string): Config {
 		provider: { ...global.provider, ...project.provider },
 		compaction: { ...global.compaction, ...project.compaction },
 		branchSummary: { ...global.branchSummary, ...project.branchSummary },
+		webSearch: { ...global.webSearch, ...project.webSearch },
 	};
 }
