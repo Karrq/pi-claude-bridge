@@ -47,6 +47,7 @@ describe("loadConfig", () => {
 				askClaude: { enabled: false },
 				compaction: {},
 				branchSummary: {},
+				webSearch: {},
 			});
 		} finally {
 			rmSync(cwd, { recursive: true, force: true });
@@ -75,6 +76,7 @@ describe("loadConfig", () => {
 				askClaude: { enabled: false, defaultMode: "read" },
 				compaction: {},
 				branchSummary: {},
+				webSearch: {},
 			});
 		} finally {
 			rmSync(cwd, { recursive: true, force: true });
@@ -193,6 +195,7 @@ describe("loadConfig", () => {
 				askClaude: {},
 				compaction: {},
 				branchSummary: {},
+				webSearch: {},
 			});
 		} finally {
 			if (oldEnv === undefined) delete process.env.PI_CODING_AGENT_DIR;

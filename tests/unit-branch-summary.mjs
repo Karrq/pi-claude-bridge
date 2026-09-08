@@ -20,7 +20,13 @@ const { default: activate, __test } = await import("../src/index.js");
 
 function activateWithMockPi() {
 	const handlers = new Map();
-	activate({ on: (event, handler) => handlers.set(event, handler), registerProvider: () => {} });
+	activate({
+		on: (event, handler) => handlers.set(event, handler),
+		registerProvider: () => {},
+		// Reached only when AskClaude or webSearch is enabled, so a developer whose
+		// global config turns either one on is the one who sees activation fail here.
+		registerTool: () => {},
+	});
 	return handlers;
 }
 
