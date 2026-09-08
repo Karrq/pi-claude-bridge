@@ -143,6 +143,13 @@ export function startDebugCaptureProxy(outDir: string, onReady: (url: string) =>
 		const port = typeof address === "object" && address ? address.port : 0;
 		onReady(`http://127.0.0.1:${port}`);
 	});
+	// A debug listener must never be the reason a process stays alive. Without this
+	// the socket holds the event loop open until something calls close(), so an
+	// embedder that activates the extension without ever emitting session_shutdown
+	// — a unit test, most concretely — hangs at exit with the capture enabled.
+	// Nothing is lost by exiting on an idle proxy: an in-flight capture implies an
+	// in-flight query, whose own handles keep the loop alive on their own.
+	server.unref();
 
 	return { outDir, close: () => server.close() };
 }
