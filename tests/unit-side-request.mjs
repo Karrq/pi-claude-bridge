@@ -20,13 +20,17 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deleteSession, openSession } from "cc-session-io";
-import { getApiProvider } from "@earendil-works/pi-ai/compat";
+import { getApiProvider, resetApiProviders } from "@earendil-works/pi-ai/compat";
 
 const { default: activate, __test } = await import("../src/index.js");
 
 function activateWithMockPi() {
 	const handlers = new Map();
-	activate({ on: (event, handler) => handlers.set(event, handler), registerProvider: () => {} });
+	activate({
+		on: (event, handler) => handlers.set(event, handler),
+		registerProvider: () => {},
+		registerTool: () => {},
+	});
 	return handlers;
 }
 
@@ -40,16 +44,25 @@ describe("api provider registration", () => {
 			"unregistered here, an extension's own agentLoop on a bridge model throws where nothing catches it",
 		);
 
-		// A live session keeps serving side requests, so only shutdown may withdraw it.
 		handlers.get("session_start")({ reason: "new" }, {});
 		assert.ok(getApiProvider("claude-bridge"), "session_start must not withdraw the registration");
 
+		// Shutdown must not withdraw it either. A side request outlives the turn that
+		// started it: an extension whose turn_end hook launches background work is still
+		// mid-loop when pi's `-p` shutdown lands, and withdrawing here left its next turn
+		// resolving an api id that no longer existed — which `agentLoop` does not catch,
+		// so pi exited with the conversation already complete.
 		handlers.get("session_shutdown")({}, {});
-		assert.equal(getApiProvider("claude-bridge"), undefined, "shutdown leaves no route to a torn-down module");
+		assert.ok(getApiProvider("claude-bridge"), "shutdown must not strand a side request mid-loop");
 
-		// The /reload shape: pi tears the old instance down before reactivating.
+		// The /reload shape, as pi actually performs it: session_shutdown, then pi's own
+		// registry wipe, then the new instance activates. The wipe is what clears the torn
+		// down module's route — nothing this extension does at shutdown.
+		resetApiProviders();
+		assert.equal(getApiProvider("claude-bridge"), undefined, "pi's own reset leaves no route to a torn-down module");
+
 		activateWithMockPi();
-		assert.ok(getApiProvider("claude-bridge"), "reactivation after shutdown must restore it");
+		assert.ok(getApiProvider("claude-bridge"), "reactivation after reload must restore it");
 	});
 });
 

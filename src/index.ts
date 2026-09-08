@@ -1,6 +1,6 @@
 import { calculateCost, StringEnum, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import * as piAi from "@earendil-works/pi-ai";
-import { getApiProvider, getModels, registerApiProvider, unregisterApiProviders } from "@earendil-works/pi-ai/compat";
+import { getApiProvider, getModels, registerApiProvider } from "@earendil-works/pi-ai/compat";
 import { buildSessionContext, compact, generateBranchSummary, getAgentDir, keyHint, type BranchSummaryResult, type CompactionEntry, type CustomEntry, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
@@ -152,11 +152,16 @@ function diagDump(label: string, data: Record<string, unknown>) {
 // registration can occur for the next session.
 const ACTIVE_STREAM_SIMPLE_KEY = Symbol.for("claude-bridge:activeStreamSimple");
 
-// Ours among pi-ai's api-provider registrations, so shutdown removes only the one
-// this module instance made. Per instance, not per package: a subagent instance
-// that skipped registration must not be able to unregister the parent's.
+// Ours among pi-ai's api-provider registrations. Per instance, not per package,
+// so a subagent instance that skipped registration cannot be mistaken for the
+// parent's. Nothing unregisters it: the registration lives as long as the module
+// instance, matching pi-ai's own builtins, which register at import and stay.
+// A side request outlives the turn that started it — pi's own `-p` shutdown lands
+// milliseconds after one begins — so a session-scoped registration pulls the
+// provider out from under a caller mid-loop, and pi-ai throws where `agentLoop`
+// has no catch. `/reload` needs no cleanup here either: pi calls
+// `resetApiProviders()` itself between session_shutdown and session_start.
 const API_PROVIDER_SOURCE_ID = `claude-bridge:${moduleInstanceId}`;
-let registeredApiProvider = false;
 
 // Same first-instance-wins pattern as ACTIVE_STREAM_SIMPLE_KEY: one proxy per pi
 // process, shared by every module instance (parent and subagents alike), closed
@@ -2430,13 +2435,6 @@ export default function (pi: ExtensionAPI) {
 		reportLeaks("session_shutdown");
 		clearSession("session_shutdown");
 		releaseHeldLease();
-		// Not in clearSession: that also runs on session_start, and a live session
-		// still needs to be able to serve side requests.
-		if (registeredApiProvider) {
-			unregisterApiProviders(API_PROVIDER_SOURCE_ID);
-			registeredApiProvider = false;
-			debug("side request: unregistered api provider");
-		}
 		const g = globalThis as Record<symbol, any>;
 		const proxyEntry = g[DEBUG_CAPTURE_PROXY_KEY];
 		if (proxyEntry?.ownerModuleInstanceId === moduleInstanceId) {
@@ -2587,7 +2585,6 @@ export default function (pi: ExtensionAPI) {
 			stream: streamSideRequest as any,
 			streamSimple: streamSideRequest as any,
 		}, API_PROVIDER_SOURCE_ID);
-		registeredApiProvider = true;
 		debug(`side request: registered api provider (module=${moduleInstanceId})`);
 	}
 
