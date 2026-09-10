@@ -87,6 +87,13 @@ describe("a rate-limited failure", () => {
 		assert.ok(c.turnOutput.errorMessage.includes("five_hour"));
 	});
 
+	it("appends the raw resetsAt epoch as a machine-parseable marker", async () => {
+		const c = makeCtx();
+		await consume(c, [rejection, limitResult]);
+
+		assert.ok(c.turnOutput.errorMessage.includes(`[resetsAt=${rejection.rate_limit_info.resetsAt}]`));
+	});
+
 	it("labels only the failure it caused, not a later one", async () => {
 		const c = makeCtx();
 		await consume(c, [rejection, limitResult, errorResult]);

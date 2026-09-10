@@ -548,11 +548,16 @@ function resultErrorText(message: SDKMessage): string | undefined {
  *
  *  Leading with "Claude rate limit" rather than appending keeps the phrase in any truncated
  *  render, and avoids the `<tool> failed (exit N):` shape that pi-subagents treats as a tool
- *  failure and refuses to retry. */
+ *  failure and refuses to retry.
+ *
+ *  `resetsAt` is also appended as a `[resetsAt=<unix seconds>]` marker for extensions that want
+ *  the exact reset instant rather than a locale-formatted, dateless time-of-day string — an
+ *  auto-retry command, for example, needs the real epoch to know how long to wait. */
 function describeRateLimitFailure(rejection: { rateLimitType?: string; resetsAt?: number }, failure: string): string {
 	const kind = rejection.rateLimitType ? ` (${rejection.rateLimitType})` : "";
 	const resets = rejection.resetsAt ? ` — resets ${new Date(rejection.resetsAt * 1000).toLocaleTimeString()}` : "";
-	return `Claude rate limit${kind}${resets}: ${failure}`;
+	const marker = rejection.resetsAt ? ` [resetsAt=${rejection.resetsAt}]` : "";
+	return `Claude rate limit${kind}${resets}: ${failure}${marker}`;
 }
 
 function isolatedStreamFn(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
