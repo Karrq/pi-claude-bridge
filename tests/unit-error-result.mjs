@@ -124,15 +124,32 @@ describe("error results", () => {
 		assert.strictEqual(terminal.error.errorMessage, errorResult.result);
 	});
 
-	it("does not re-emit text the synthetic assistant message already delivered", async () => {
+	// CC narrates the failure as a fabricated assistant turn before the result that
+	// reports it. Emitting that as content would leave the error notice sitting in
+	// pi's transcript as if the model had said it, and carry it into every later
+	// turn's context. The failure reaches pi through stopReason/errorMessage instead.
+	it("keeps the synthetic failure narration out of the turn's content", async () => {
 		const c = makeCtx();
 		await consume(c, [
 			{ type: "assistant", message: { model: "<synthetic>", content: [{ type: "text", text: errorResult.result }] } },
 			errorResult,
 		]);
 
+		assert.deepStrictEqual(c.turnOutput.content.filter((b) => b.type === "text"), []);
+		assert.strictEqual(c.turnOutput.stopReason, "error");
+		assert.strictEqual(c.turnOutput.errorMessage, errorResult.result);
+	});
+
+	it("keeps content from a real assistant message on an errored turn", async () => {
+		const c = makeCtx();
+		await consume(c, [
+			{ type: "assistant", message: { model: "claude-haiku-4-5-20251001", content: [{ type: "text", text: "partial answer" }] } },
+			errorResult,
+		]);
+
 		const texts = c.turnOutput.content.filter((b) => b.type === "text");
-		assert.deepStrictEqual(texts.map((b) => b.text), [errorResult.result]);
+		assert.deepStrictEqual(texts.map((b) => b.text), ["partial answer"]);
+		assert.strictEqual(c.turnOutput.errorMessage, errorResult.result);
 	});
 
 	it("still streams and finalizes a successful result normally", async () => {

@@ -11,7 +11,7 @@
 // as soon as the message they care about arrives. Run the whole file on every
 // @anthropic-ai/claude-agent-sdk or Claude Code bump.
 //
-// Verified against: SDK 0.2.141 / Claude Code 2.1.222.
+// Verified against: SDK 0.2.141 / Claude Code 2.1.266.
 //
 // Assumptions that are NOT covered here, and why:
 //   - DISABLE_AUTO_COMPACT=1 stops CC-side autocompaction. Provoking it needs a
@@ -574,4 +574,75 @@ test("includeGitInstructions:false strips gitStatus and keeps the preset static 
 		api.close();
 		rmSync(repo, { recursive: true, force: true });
 	}
+});
+
+// --- Failure narration ---
+
+test("CC narrates an API failure as a <synthetic> assistant message, and no healthy turn carries that marker", { timeout: 180_000 }, async () => {
+	// The bridge drops this message's content so an error notice never lands in
+	// pi's transcript as if the model had said it (src/index.ts SYNTHETIC_MODEL).
+	// That is only safe while the marker stays exclusive to fabricated messages,
+	// which is what the control half of this test pins. A 429 from a local
+	// endpoint stands in for the usage limit: both are an API failure CC has to
+	// narrate, and a real exhausted quota can't be provoked on demand.
+	const api = createServer((req, res) => {
+		let body = "";
+		req.on("data", (chunk) => (body += chunk));
+		req.on("end", () => {
+			if (req.url?.includes("count_tokens")) {
+				res.writeHead(200, { "content-type": "application/json" });
+				res.end(JSON.stringify({ input_tokens: 10 }));
+				return;
+			}
+			res.writeHead(429, { "content-type": "application/json" });
+			res.end(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "You're out of extra usage · resets 6:30pm" } }));
+		});
+	});
+	await new Promise((resolve) => api.listen(0, "127.0.0.1", resolve));
+
+	const drain = async (extraEnv) => {
+		const messages = [];
+		try {
+			for await (const message of query({
+				prompt: "Reply with just: OK",
+				options: providerOptions({
+					includePartialMessages: true,
+					maxTurns: 1,
+					persistSession: false,
+					env: { ...providerOptions().env, ...extraEnv },
+				}),
+			})) messages.push(message);
+		} catch {
+			// The SDK throws on the error result; the messages it yielded first are the subject.
+		}
+		return messages;
+	};
+
+	let failed;
+	try {
+		failed = await drain({ ANTHROPIC_BASE_URL: `http://127.0.0.1:${api.address().port}` });
+	} finally {
+		api.close();
+	}
+
+	const synthetic = failed.filter((m) => m.type === "assistant" && m.message?.model === "<synthetic>");
+	assert.equal(synthetic.length, 1, `expected exactly one <synthetic> assistant message, got ${synthetic.length}`);
+	assert.match(synthetic[0].message.content.map((b) => b.text ?? "").join(""), /API Error/,
+		"the <synthetic> message no longer carries the failure text the bridge suppresses");
+	// No stream_event frames precede it, so the bridge only sees this on the
+	// assistant-message path — processStreamEvent needs no equivalent guard.
+	assert.equal(failed.filter((m) => m.type === "stream_event").length, 0,
+		"CC now streams the failure narration too; processStreamEvent needs the same guard");
+	const failResult = failed.find((m) => m.type === "result");
+	assert.equal(failResult?.is_error, true, "the failure still arrives as an errored result");
+
+	// Control: a healthy turn must not look like a fabricated one, or the bridge
+	// would be dropping real model output.
+	const ok = await drain({});
+	const assistants = ok.filter((m) => m.type === "assistant");
+	assert.ok(assistants.length > 0, "control turn produced no assistant message");
+	for (const m of assistants) {
+		assert.notEqual(m.message?.model, "<synthetic>", "a healthy turn carried the <synthetic> marker");
+	}
+	assert.equal(ok.find((m) => m.type === "result")?.is_error, false, "control turn did not succeed");
 });

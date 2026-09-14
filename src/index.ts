@@ -75,6 +75,11 @@ const CC_CHILD_ENV = {
 // while rules need their own. Managed/policy memory is not excludable by design.
 const CLAUDE_MD_EXCLUDES = ["**/CLAUDE.md", "**/.claude/rules/**"];
 
+// The `model` Claude Code stamps on an assistant message it fabricated itself
+// rather than received from the API. Its own source keys on this exact string to
+// exclude such messages from turn history; no real completion carries it.
+const SYNTHETIC_MODEL = "<synthetic>";
+
 // Ensure log directories exist when debug is enabled
 if (DEBUG) {
 	try {
@@ -1370,6 +1375,19 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 	if (c.turnSawStreamEvent) return;
 	const assistantMsg = (message as any).message;
 	if (!assistantMsg?.content) return;
+	// CC narrates an API failure as a fabricated assistant turn — model
+	// "<synthetic>", text like "API Error: ... You're out of extra usage" — before
+	// the result that actually reports the failure. Emitting it as content would
+	// persist the error notice in pi's transcript as if the model had said it, and
+	// carry it into every later turn's context. The failure still reaches pi: the
+	// result sets stopReason "error" plus errorMessage. CC's own turn-tail analysis
+	// skips this marker the same way (alongside isApiErrorMessage/isVirtual, which
+	// do not survive to the SDK stream), and no healthy turn carries it — pinned in
+	// tests/int-cc-contracts.mjs, measured by diag/probe-synthetic-error.mjs.
+	if (assistantMsg.model === SYNTHETIC_MODEL) {
+		debug(`processAssistantMessage: skipping synthetic failure narration (${assistantMsg.content.length} blocks)`);
+		return;
+	}
 	c.turnToolCallIds = [];
 	debug(`processAssistantMessage fallback: ${assistantMsg.content.length} blocks, types=${assistantMsg.content.map((b: any) => b.type).join(",")}`);
 	for (const block of assistantMsg.content) {
