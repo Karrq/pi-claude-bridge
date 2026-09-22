@@ -94,6 +94,21 @@ describe("a rate-limited failure", () => {
 		assert.ok(c.turnOutput.errorMessage.includes(`[resetsAt=${rejection.rate_limit_info.resetsAt}]`));
 	});
 
+	// Against the installed pi-ai, not a copy of its patterns: pi's auto-retry asks this
+	// exact function, so if its lists move, this fails here rather than in a user's session
+	// as three doomed retries against a limit that resets hours later.
+	it("reads as non-retryable to pi's own auto-retry", async () => {
+		const { isRetryableAssistantError } = await import("@earendil-works/pi-ai");
+		const c = makeCtx();
+		await consume(c, [rejection, limitResult]);
+
+		assert.equal(isRetryableAssistantError(c.turnOutput), false,
+			`pi would auto-retry a spent subscription: ${c.turnOutput.errorMessage}`);
+		// The raw CC wording was already non-retryable; the label must not have been what
+		// made it retryable, which is the regression this guards.
+		assert.equal(isRetryableAssistantError({ role: "assistant", stopReason: "error", errorMessage: limitResult.result }), false);
+	});
+
 	it("labels only the failure it caused, not a later one", async () => {
 		const c = makeCtx();
 		await consume(c, [rejection, limitResult, errorResult]);

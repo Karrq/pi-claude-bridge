@@ -545,14 +545,23 @@ function resultErrorText(message: SDKMessage): string | undefined {
  *  render, and avoids the `<tool> failed (exit N):` shape that pi-subagents treats as a tool
  *  failure and refuses to retry.
  *
+ *  "quota exceeded" is there for pi's own auto-retry, which reads the same string through
+ *  pi-ai's `isRetryableAssistantError`: "rate limit" alone puts us in its retryable set, so pi
+ *  spent its whole budget (3 attempts at 2s/4s/8s by default) re-sending a turn against a limit
+ *  that resets hours later, and each doomed attempt left another errored assistant message in
+ *  the session. That list checks a non-retryable set first, which "quota exceeded" is in, so the
+ *  phrase reclassifies a spent subscription as what it is: not a transient throttle. This only
+ *  reaches CC failures that a rate-limit rejection preceded, never an ordinary 429. Extensions
+ *  matching on "rate limit" are unaffected, and pinned in tests/unit-error-result.mjs.
+ *
  *  `resetsAt` is also appended as a `[resetsAt=<unix seconds>]` marker for extensions that want
  *  the exact reset instant rather than a locale-formatted, dateless time-of-day string — an
  *  auto-retry command, for example, needs the real epoch to know how long to wait. */
 function describeRateLimitFailure(rejection: { rateLimitType?: string; resetsAt?: number }, failure: string): string {
 	const kind = rejection.rateLimitType ? ` (${rejection.rateLimitType})` : "";
-	const resets = rejection.resetsAt ? ` — resets ${new Date(rejection.resetsAt * 1000).toLocaleTimeString()}` : ""; // resetsAt: Unix seconds (unit undocumented in the SDK; observed)
+	const resets = rejection.resetsAt ? `, resets ${new Date(rejection.resetsAt * 1000).toLocaleTimeString()}` : ""; // resetsAt: Unix seconds (unit undocumented in the SDK; observed)
 	const marker = rejection.resetsAt ? ` [resetsAt=${rejection.resetsAt}]` : "";
-	return `Claude rate limit${kind}${resets}: ${failure}${marker}`;
+	return `Claude rate limit${kind} — quota exceeded${resets}: ${failure}${marker}`;
 }
 
 function isolatedStreamFn(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
