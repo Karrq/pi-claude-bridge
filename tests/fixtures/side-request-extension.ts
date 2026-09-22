@@ -36,7 +36,9 @@ export default function (pi: ExtensionAPI) {
 					content: [{ type: "text", text: `Record a note whose content is exactly the word ${word}.` }],
 					timestamp: Date.now(),
 				}],
-				{ systemPrompt: NOTE_TAKER_SYSTEM, messages: [], tools: [recordNote] },
+				// pi 0.86 carries the system prompt as a leading system message; AgentContext
+				// no longer has a systemPrompt field.
+				{ messages: [{ role: "system", content: NOTE_TAKER_SYSTEM, timestamp: Date.now() } as any], tools: [recordNote] },
 				{ model, convertToLlm: (messages) => messages as any, toolExecution: "sequential" } as any,
 				// No streamFn, which is the whole point: pi-ai's default is what routes by
 				// api id, and it is the only route an extension like this one has.

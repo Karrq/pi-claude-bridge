@@ -23,8 +23,10 @@ function activateWithMockPi() {
 	activate({
 		on: (event, handler) => handlers.set(event, handler),
 		registerProvider: () => {},
-		// Reached only when AskClaude or webSearch is enabled, so a developer whose
-		// global config turns either one on is the one who sees activation fail here.
+		// Reached only when AskClaude or webSearch is enabled (e.g. a developer's global
+		// ~/.pi/agent/claude-bridge.json turns one on), and a mock missing it throws
+		// before any handler is registered. CI has no such config, so this only
+		// surfaces locally.
 		registerTool: () => {},
 	});
 	return handlers;

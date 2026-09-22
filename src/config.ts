@@ -52,6 +52,9 @@ export interface Config {
 			// Defaults to <agent dir>/claude-bridge-captures/<timestamp>-<instance id>.
 			outDir?: string;
 		};
+		// Model ids (e.g. "claude-future-9") whose declared 1M context Claude Code
+		// does not actually serve; pins them to the bare id at 200K.
+		forceTwoHundredK?: string[];
 	};
 	compaction?: {
 		// When true (default), the extension answers session_before_compact and
