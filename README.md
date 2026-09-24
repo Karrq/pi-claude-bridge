@@ -21,7 +21,7 @@ Pi extension that integrates Claude Code via the [Agent SDK](https://github.com/
 pi install npm:pi-claude-bridge
 ```
 
-Requires pi 0.85.0 or newer (`pi-ai`, `pi-coding-agent`, `pi-tui`); pi 0.86 needs bridge 0.8.0 or newer. With an older pi-ai the model picker comes up empty, and the bridge logs which dependency to update.
+Requires pi 0.86.1 or newer (`pi-ai`, `pi-coding-agent`, `pi-tui`). With an older pi-ai the model picker comes up empty, and the bridge logs which dependency to update.
 
 ## Provider
 
@@ -33,7 +33,7 @@ The model list comes from pi-ai's Anthropic catalog automatically — when pi-ai
 
 **Other extensions' own model calls:** some extensions run a small agent of their own — to summarize, label or take notes — rather than going through the conversation. On a bridge model those calls used to crash pi outright; they now run as their own Claude Code session, using the calling extension's system prompt and tools and leaving your conversation's session alone. Each one is a Claude Code subprocess on the model you selected, so if an extension makes them often, consider pointing it at a cheaper model where it lets you.
 
-**1M Context:** 1M is enabled per a *measured* list — models verified to serve 1M through the SDK on every plan (Fable 5/5.1, Opus 5/4.8/4.7, Sonnet 5). A new model appearing from pi-ai starts at 200K context until it's measured and added to that list, so no model can 400/429 its way through every turn. Opus 4.6 only gets 1M if you're on a Max plan or pay for Extra Usage. Sonnet 4.6 only gets 1M if you pay for Extra Usage. You will need to set `provider.plan` and/or `provider.longContextExtraUsage` for 1M context in Opus 4.6/Sonnet 4.6 as described in [Configuration](#configuration).
+**1M Context:** 1M is enabled for an explicit list: Fable 5/5.1, Opus 5.5/5/4.8/4.7, and Sonnet 5. Opus 5.5 was measured on Max with Extra Usage off, where the bare id and `[1m]` both serve 1M; on Pro it is still unmeasured and rests on [Anthropic's documentation](https://code.claude.com/docs/en/model-config#extended-context) for Opus 4.7 and later (see `diag/CONTEXT-SIZE.md`). Other models on the list were verified through the SDK. A new model appearing from pi-ai starts at 200K context until explicitly added, to avoid sending unsupported `[1m]` requests. Opus 4.6 only gets 1M if you're on a Max plan or pay for Extra Usage. Sonnet 4.6 only gets 1M if you pay for Extra Usage. You will need to set `provider.plan` and/or `provider.longContextExtraUsage` for 1M context in Opus 4.6/Sonnet 4.6 as described in [Configuration](#configuration).
 
 ## AskClaude Tool
 
@@ -137,6 +137,18 @@ Set `CLAUDE_BRIDGE_DEBUG=1` to enable debug output:
 - **Per-query Claude Code CLI logs** at `~/.pi/agent/cc-cli-logs/<timestamp>-<tag>-<seq>.log` — the CC subprocess's own debug stream, one file per `query()` call. Tags are `provider` (main turn) or `askclaude` (sub-delegation). Useful when a resume fails or CC misbehaves internally — shows the CLI's own view of session loading, API requests, and tool calls.
 
 When filing a bug about a session-resume failure (e.g. "No conversation found"), the most useful attachments are the `syncResult:` lines from the bridge log plus the matching `cc-cli-logs/` file for the failing query.
+
+## Compatibility with other extensions
+
+Other extensions can change the system prompt. When the result still contains pi's built-in system prompt text, or the two documentation paths that Anthropic looks for (`docs/custom-provider.md` in the same prompt with `docs/packages.md`), the bridge stops the turn instead of sending it. Otherwise Anthropic may try to bill these requests as Extra Usage. The stop repeats on every later turn in that session, since the same prompt is captured again, so fix the source before retrying. If you run into issues, `CLAUDE_BRIDGE_DEBUG=1` writes the full prompt to `~/.pi/agent/claude-bridge.log` when that happens.
+
+### Using claude bridge with @gotgenes/pi-subagents
+
+Requires the following in `~/.pi/agent/subagents.json`:
+
+```json
+{"promptInheritance": {"claude-bridge": "portable"}}
+```
 
 ## Known issues
 
