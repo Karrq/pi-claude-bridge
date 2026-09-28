@@ -70,7 +70,7 @@ describe("side request session", () => {
 	it("holds the caller's own history and leaves the shared session alone", () => {
 		const cwd = mkdtempSync(join(tmpdir(), "side-request-"));
 		const mainSession = { sessionId: "11111111-1111-4111-8111-111111111111", cursor: 42, cwd };
-		__test.setSharedSession(mainSession);
+		__test.setSharedSession(null, mainSession);
 		let sessionId;
 		try {
 			sessionId = __test.buildSideRequestSession([
