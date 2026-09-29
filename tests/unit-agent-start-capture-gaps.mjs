@@ -16,7 +16,7 @@
  *    verbatim and is covered by the agent_start record.)
  * 2. A prompt composed entirely outside pi's before_agent_start pipeline (issue #102's
  *    pi-web-ui shape) is neither a rendered-options key, a handler-returned force
- *    (which agent_start does capture — see the force test below), nor an embedding.
+ *    (which agent_start captures and forwards — see the force test below), nor an embedding.
  * 3. A prompt that changes AFTER turn_start (issue #91's remaining shape): turn_start
  *    re-keys every turn (first included), but a prompt rewritten between turn_start and
  *    the stream call — an extension context-event handler or a forced-prompt projection
@@ -110,19 +110,43 @@ describe("agent_start capture — documented gaps", () => {
 		);
 	});
 
-	it("does capture a handler-returned wholesale replacement: it resolves via the agent_start key", () => {
+	it("forwards a handler-returned wholesale replacement as the custom prompt, and nothing else", () => {
 		const handlers = activateWithMockPi();
-		handlers.get("before_agent_start")({ systemPrompt: "pi rendered prompt", systemPromptOptions: {} });
-		// A before_agent_start handler that RETURNS a system prompt forces it as the request
-		// head, and pi renders ctx.getSystemPrompt() as exactly that forced text
+		const FORCED = "forced replacement prompt owning the request head";
+		// pi hands every before_agent_start handler the same options object and sets
+		// forceSystemPrompt on it when one RETURNS a system prompt, so the bridge's stash
+		// carries the force by agent_start even when the bridge's handler ran first.
+		const options = {
+			appendSystemPrompt: "user append",
+			contextFiles: [{ path: "/repo/AGENTS.md", content: "project rules" }],
+		};
+		handlers.get("before_agent_start")({ systemPrompt: "pi rendered prompt", systemPromptOptions: options });
+		options.forceSystemPrompt = FORCED;
+		// pi renders ctx.getSystemPrompt() as exactly the forced text
 		// (buildSystemPromptState returns forceSystemPrompt verbatim).
-		handlers.get("agent_start")({}, { getSystemPrompt: () => "forced replacement prompt owning the request head" });
+		handlers.get("agent_start")({}, { getSystemPrompt: () => FORCED });
 
-		const capture = __test.promptCaptures.resolve("forced replacement prompt owning the request head");
+		const capture = __test.promptCaptures.resolve(FORCED);
 		assert.ok(capture, "the forced text becomes a capture key at agent_start");
-		// Caveat pinned by design: only the portable parts are projected for Claude Code;
-		// the forced text's own novel prose is not forwarded (forwarding pi-harness-shaped
-		// prose would trip the server's third-party gate).
+		assert.equal(
+			projectPromptCapture(capture, { skillReadTool: "none" }),
+			FORCED,
+			"the forced text replaces the append and context files, as it does in pi",
+		);
+	});
+
+	it("does not apply a stale force to a later turn that renders pi's own prompt", () => {
+		const handlers = activateWithMockPi();
+		const options = { appendSystemPrompt: "user append", forceSystemPrompt: "forced by the previous run" };
+		handlers.get("before_agent_start")({ systemPrompt: "forced by the previous run", systemPromptOptions: options });
+		// An idle triggerTurn skips before_agent_start, so the stash still carries the force
+		// while pi renders its own prompt for this turn.
+		handlers.get("turn_start")({}, { getSystemPrompt: () => "pi rendered prompt" });
+
+		const capture = __test.promptCaptures.resolve("pi rendered prompt");
+		assert.ok(capture);
+		assert.equal(capture.custom, undefined, "the forced text belongs only to the prompt it rendered");
+		assert.equal(capture.append, "user append");
 	});
 
 	it("does not rescue a prompt composed outside the before_agent_start pipeline (#102 shape)", () => {

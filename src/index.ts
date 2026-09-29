@@ -2842,12 +2842,21 @@ export default function (pi: ExtensionAPI) {
 	let lastSystemPromptOptions: RecordOptions | undefined;
 	function recordSystemPrompt(source: string, systemPrompt: string | undefined, options: {
 		customPrompt?: string;
+		forceSystemPrompt?: string;
 		appendSystemPrompt?: string;
 		contextFiles?: { path: string; content: string }[];
 		skills?: Parameters<typeof promptCaptures.record>[1]["skills"];
 		selectedTools?: string[];
 	} | undefined) {
 		if (!systemPrompt) return;
+		// A handler-returned prompt replaces pi's whole prompt, context files, skills and
+		// append included, so it is the custom prompt and nothing else is. Matched against
+		// the rendered prompt because the stashed options outlive the run that forced it:
+		// an idle triggerTurn skips before_agent_start and renders pi's own prompt again.
+		if (options?.forceSystemPrompt !== undefined && options.forceSystemPrompt === systemPrompt) {
+			promptCaptures.record(systemPrompt, { custom: systemPrompt, contextFiles: [], skills: [] }, source);
+			return;
+		}
 		const hasRead = !options?.selectedTools || options.selectedTools.includes("read");
 		promptCaptures.record(systemPrompt, {
 			custom: options?.customPrompt,
@@ -2871,7 +2880,9 @@ export default function (pi: ExtensionAPI) {
 	// ("out of extra usage"). Recording it here, before the query, restores the match.
 	//
 	// agent_start also captures a handler-returned forceSystemPrompt, which
-	// buildSystemPrompt renders verbatim.
+	// buildSystemPrompt renders verbatim. pi sets it on the same options object the
+	// before_agent_start event carried, so the stash sees it whichever order the
+	// handlers ran in.
 	pi.on("agent_start", (_event, ctx) => {
 		recordSystemPrompt("agent_start", ctx.getSystemPrompt(), lastSystemPromptOptions);
 	});
