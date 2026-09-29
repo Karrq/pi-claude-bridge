@@ -106,10 +106,28 @@ export function startDebugCaptureProxy(outDir: string, onReady: (url: string) =>
 				return;
 			}
 
-			const text = await upstreamRes.text();
 			const responseHeaders: Record<string, string> = {};
 			for (const [k, v] of upstreamRes.headers) if (!["content-encoding", "content-length", "transfer-encoding"].includes(k)) responseHeaders[k] = v;
-			res.writeHead(upstreamRes.status, responseHeaders).end(text);
+			res.writeHead(upstreamRes.status, responseHeaders);
+
+			// Forward each chunk as it arrives. Buffering the whole body first would hand
+			// CC the SSE stream in one piece after the model finished, so every delta
+			// (thinking, text, tool input) would reach pi at once instead of streaming.
+			let text = "";
+			const decoder = new TextDecoder();
+			try {
+				if (upstreamRes.body) {
+					for await (const chunk of upstreamRes.body) {
+						res.write(chunk);
+						text += decoder.decode(chunk, { stream: true });
+					}
+				}
+				text += decoder.decode();
+				res.end();
+			} catch (error) {
+				res.destroy(error as Error);
+				return;
+			}
 
 			let parsed: { model?: string; messages?: unknown[]; tools?: unknown[] } | null = null;
 			try { parsed = JSON.parse(body.toString("utf8")); } catch { /* not JSON, e.g. a HEAD probe */ }

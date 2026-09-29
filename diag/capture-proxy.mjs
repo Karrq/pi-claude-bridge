@@ -98,10 +98,29 @@ createServer((req, res) => {
 			return;
 		}
 
-		const text = await upstream.text();
 		const responseHeaders = {};
 		for (const [k, v] of upstream.headers) if (!["content-encoding", "content-length", "transfer-encoding"].includes(k)) responseHeaders[k] = v;
-		res.writeHead(upstream.status, responseHeaders).end(text);
+		res.writeHead(upstream.status, responseHeaders);
+
+		// Forward each chunk as it arrives. Buffering the whole body first would hand
+		// CC the SSE stream in one piece after the model finished, so every delta
+		// (thinking, text, tool input) would reach pi at once instead of streaming.
+		let text = "";
+		const decoder = new TextDecoder();
+		try {
+			if (upstream.body) {
+				for await (const chunk of upstream.body) {
+					res.write(chunk);
+					text += decoder.decode(chunk, { stream: true });
+				}
+			}
+			text += decoder.decode();
+			res.end();
+		} catch (error) {
+			console.error(`[${n}] upstream stream failed: ${error.message}`);
+			res.destroy(error);
+			return;
+		}
 
 		let parsed = null;
 		try { parsed = JSON.parse(body.toString("utf8")); } catch {}
