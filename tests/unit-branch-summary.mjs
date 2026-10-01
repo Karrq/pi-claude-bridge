@@ -15,22 +15,9 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { activateWithMockPi } from "./lib/mock-pi.mjs";
 
-const { default: activate, __test } = await import("../src/index.js");
-
-function activateWithMockPi() {
-	const handlers = new Map();
-	activate({
-		on: (event, handler) => handlers.set(event, handler),
-		registerProvider: () => {},
-		// Reached only when AskClaude or webSearch is enabled (e.g. a developer's global
-		// ~/.pi/agent/claude-bridge.json turns one on), and a mock missing it throws
-		// before any handler is registered. CI has no such config, so this only
-		// surfaces locally.
-		registerTool: () => {},
-	});
-	return handlers;
-}
+const { __test } = await import("../src/index.js");
 
 const treeEvent = (preparation) => ({ preparation, signal: new AbortController().signal });
 const preparation = { targetId: "abcdef1234", entriesToSummarize: [{}], userWantsSummary: true };
