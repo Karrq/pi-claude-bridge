@@ -31,6 +31,19 @@ import { acquireOrRefreshLease, releaseLease } from "./session-lease.js";
 import { askClaudeCallTags, askClaudeToolDescription, buildAskClaudeParams, resolveAskClaudeDefaults, resolveAskClaudeMode, type AskClaudeMode } from "./askclaude-schema.js";
 import { nonSystemMessages, toBridgeContext } from "./transcript.js";
 import { updateUsage, type SdkUsage } from "./usage.js";
+import {
+	armForTurn as armWarming,
+	cancelAll as cancelAllWarming,
+	cancelKey as cancelWarmingKey,
+	cancelSession as cancelWarmingSession,
+	configureWarmScheduler,
+	warmKey,
+	warmPriceMap,
+	warmStates,
+	type WarmSnapshot,
+	type WarmState,
+} from "./warm-scheduler.js";
+import { buildReplayMcpServers, runWarmReplay } from "./warm-replay.js";
 
 // --- Debug logging ---
 // CLAUDE_BRIDGE_DEBUG=1 enables debug logging to the bridge log in pi's agent
@@ -94,7 +107,9 @@ if (DEBUG) {
 // Unique per module evaluation — confirms whether subagents share module state
 const moduleInstanceId = Math.random().toString(36).slice(2, 8);
 
-function debug(...args: unknown[]) {
+// Exported so sibling modules (e.g. warm-replay.js) can log to the same file
+// through the same DEBUG gate rather than growing their own log plumbing.
+export function debug(...args: unknown[]) {
 	if (!DEBUG) return;
 	const ts = new Date().toISOString();
 	const fmt = (a: unknown): string => {
@@ -193,8 +208,13 @@ const SDK_TO_PI_TOOL_NAME: Record<string, string> = {
 	read: "read", write: "write", edit: "edit", bash: "bash",
 };
 
-// MODELS is buildModels(getModels("anthropic")) — projection kept in models.js.
-const MODELS = buildModels(getModels("anthropic"));
+// MODELS is buildModels(ANTHROPIC_MODELS) — projection kept in models.js.
+const ANTHROPIC_MODELS = getModels("anthropic");
+const MODELS = buildModels(ANTHROPIC_MODELS);
+// Real catalog prices, read before buildModels zeroes the registered copy. The
+// cache-warming cost estimate needs the un-zeroed numbers, and only the catalog
+// has them (see warm-scheduler.ts).
+const WARM_PRICES = warmPriceMap(ANTHROPIC_MODELS);
 let providerSettings: NonNullable<Config["provider"]> = {};
 let longContextSettings: LongContextSettings = { plan: "pro", longContextExtraUsage: false };
 
@@ -315,6 +335,54 @@ function sessionStateFor(piSessionId: string | null | undefined): SessionState |
 function setSessionStateFor(piSessionId: string | null | undefined, state: SessionState | null): void {
 	if (state === null) sharedSessions.delete(sessionKey(piSessionId));
 	else sharedSessions.set(sessionKey(piSessionId), state);
+}
+
+// --- Prompt-cache warming: the snapshot of a real turn's request ---
+//
+// A warm probe (src/warm-replay.ts) refreshes the shared prefix only if it
+// reproduces the exact request the last real turn sent. Everything that request
+// was built from is captured here, keyed by (pi session, model) so a model
+// switch leaves the previous model's window warm and a switch back costs
+// nothing. Written on every real turn; read by the warming hooks in activate().
+const warmSnapshots = new Map<string, WarmSnapshot>();
+
+/** Key for the snapshot of one (pi session, model) pair. */
+export function warmSnapshotKey(piSessionId: string, modelId: string): string {
+	return `${piSessionId}\u0000${modelId}`;
+}
+
+/** Record (or replace) the parameters of the request a real turn just sent. */
+function recordWarmSnapshot(input: Omit<WarmSnapshot, "at">): void {
+	const snapshot: WarmSnapshot = { ...input, at: Date.now() };
+	warmSnapshots.set(warmSnapshotKey(input.piSessionId, input.model), snapshot);
+	debug(`warm-snapshot: recorded ${input.piSessionId.slice(0, 8)}/${input.model} session=${input.ccSessionId.slice(0, 8)} tools=${input.mcpTools.length} effort=${input.effort ?? "default"} append=${input.systemPromptAppend?.length ?? 0} chars`);
+}
+
+/** The snapshot this extension has for a (pi session, model) pair, or undefined
+ *  when that pair has not run a real turn in this process. */
+export function getWarmSnapshot(piSessionId: string | null | undefined, modelId: string): WarmSnapshot | undefined {
+	if (!piSessionId) return undefined;
+	return warmSnapshots.get(warmSnapshotKey(piSessionId, modelId));
+}
+
+/** Prompt size of the last real turn on a session's branch — what a refresh
+ *  pays a cache read for, and what the warming cost gate is measured against.
+ *  The same derivation pi's native warmer uses (usage.input + cacheRead +
+ *  cacheWrite of the newest assistant message). */
+function lastPromptTokens(ctx: ExtensionContext): number {
+	try {
+		const branch = ctx.sessionManager?.getBranch() ?? [];
+		for (let i = branch.length - 1; i >= 0; i--) {
+			const entry = branch[i] as { type?: string; message?: { role?: string; usage?: { input?: number; cacheRead?: number; cacheWrite?: number } } };
+			if (entry.type !== "message" || entry.message?.role !== "assistant") continue;
+			const usage = entry.message.usage;
+			if (!usage) continue;
+			return (usage.input ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
+		}
+	} catch (error) {
+		debug("warm: lastPromptTokens failed:", error);
+	}
+	return 0;
 }
 
 // pi replaced one of its sessions' history (compact, tree) rather than appending
@@ -1964,6 +2032,107 @@ function streamSideRequest(model: Model<any>, context: Context, options?: Simple
 	}
 }
 
+type ProviderQueryOptions = NonNullable<Parameters<typeof query>[0]["options"]>;
+
+/** MCP servers as the SDK's options take them (a name → tool-server map). */
+export type ProviderMcpServers = NonNullable<ProviderQueryOptions["mcpServers"]>;
+
+/**
+ * Claude Code CLI extra args for the provider path. `model` carries the id the
+ * CLI actually runs (which may be a `[1m]` variant); `--strict-mcp-config` keeps
+ * filesystem MCP entries out of a request whose tools block must be exactly the
+ * pi tools; `thinking-display` makes a thinking model stream its thinking.
+ */
+export function buildProviderExtraArgs(cliModel: string, effort: EffortLevel | undefined): Record<string, string | null> {
+	const extraArgs: Record<string, string | null> = { model: cliModel };
+	if (providerSettings.strictMcpConfig !== false) extraArgs["strict-mcp-config"] = null;
+	// Opus 4.7 defaults thinking.display to "omitted" (empty thinking text in stream).
+	// Force summarized so thinking_delta events arrive. See anthropics/claude-agent-sdk-python#830.
+	if (effort) extraArgs["thinking-display"] = "summarized";
+	return extraArgs;
+}
+
+/**
+ * Query options for a Claude Code subprocess, shared by the provider path and
+ * the cache-warming probe (src/warm-replay.ts).
+ *
+ * Every request-defining field is here on purpose: a probe that differs from the
+ * request the real turn sent rewrites the prompt cache instead of reading it, so
+ * both callers must build their options the same way. `tools: []` and
+ * `permissionMode: "bypassPermissions"` are the provider path's fixed choices —
+ * pi executes tools, Claude Code must not — and the tool schemas the cached
+ * prefix contains come from `mcpServers`, not from `tools`.
+ */
+export function buildProviderQueryOptions(p: {
+	cwd: string;
+	model: string;
+	side: boolean;
+	systemPromptAppend?: string;
+	sideSystemPrompt?: string;
+	mcpServers?: ProviderMcpServers;
+	effort?: EffortLevel;
+	extraArgs: Record<string, string | null>;
+	resumeSessionId?: string;
+	claudeExecutable?: string;
+	// Warm-only overrides.
+	forkSession?: boolean;
+	persistSession?: boolean;
+	maxTurns?: number;
+	tools?: string[];
+	debugTag?: string;
+}): ProviderQueryOptions {
+	// Suppress claude.ai cloud MCP servers (Figma/Canva/etc. auto-discovered via OAuth
+	// when the user is logged into Anthropic). These are a separate code path from
+	// filesystem MCP and are NOT blocked by --strict-mcp-config or settingSources=undefined.
+	// The native CC binary gates them on env var ENABLE_CLAUDEAI_MCP_SERVERS: setting it
+	// to "0"/"false"/"no"/"off" makes the loader return early before any cloud fetch.
+	// DISABLE_AUTO_COMPACT=1: pi owns context-management and propagates its own
+	// /compact via session_compact (see handler in default export). Letting CC
+	// also autocompact would double-flush the prompt cache and races pi's
+	// threshold with CC's, including CC's anti-thrashing guard (issue #8).
+	// Manual /compact in CC still works (we never invoke it).
+	const childEnv = { ...process.env, ...CC_CHILD_ENV, ...getDebugProxyEnv() };
+	return {
+		cwd: p.cwd,
+		env: childEnv,
+		tools: p.tools ?? [],
+		permissionMode: "bypassPermissions",
+		includePartialMessages: true,
+		// includeGitInstructions:false drops the gitStatus block from the preset.
+		// That block is the trailing suffix of the cached system block, and a
+		// git-state transition (new file, staging, commit) rewrites it — busting
+		// the prompt cache for the whole conversation from there on (see
+		// diag/probe-git-cache.mjs). The bridge re-invokes CC per turn, so this
+		// hit on every transition. Cost here is nil: the setting also strips
+		// CC's git-workflow guidance from its Bash tool prompt, but the provider
+		// path runs CC with `tools: []`, so those definitions never ship.
+		// AskClaude keeps CC's native tools and its guidance — unaffected.
+		settings: {
+			...claudeCodeSettings(providerSettings),
+			claudeMdExcludes: CLAUDE_MD_EXCLUDES,
+			includeGitInstructions: false,
+		},
+		// A side request's prompt replaces Claude Code's preset rather than appending to
+		// it: the caller wrote a complete prompt for a single narrow job, and the coding
+		// agent preset would talk it into being a coding agent.
+		systemPrompt: p.side
+			? p.sideSystemPrompt
+			: {
+				type: "preset", preset: "claude_code",
+				append: p.systemPromptAppend ? p.systemPromptAppend : undefined,
+			},
+		extraArgs: p.extraArgs,
+		...(p.effort ? { effort: p.effort } : {}),
+		...(p.mcpServers ? { mcpServers: p.mcpServers } : {}),
+		...(p.resumeSessionId ? { resume: p.resumeSessionId } : {}),
+		...(p.claudeExecutable ? { pathToClaudeCodeExecutable: p.claudeExecutable } : {}),
+		...(p.forkSession ? { forkSession: true } : {}),
+		...(p.persistSession !== undefined ? { persistSession: p.persistSession } : {}),
+		...(p.maxTurns !== undefined ? { maxTurns: p.maxTurns } : {}),
+		...makeCliDebugOptions(p.debugTag ?? (p.side ? "side-request" : "provider")),
+	};
+}
+
 function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions, side = false): AssistantMessageEventStream {
 	if (!side) showStartupNoticeOnce();
 	// pi hands providers a transcript (prompt/tools folded into system messages) — fold it
@@ -2236,59 +2405,37 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			: VALID_EFFORTS.has(mapped as EffortLevel) ? mapped as EffortLevel : undefined
 		: undefined;
 
-	const extraArgs: Record<string, string | null> = { model: cliModel };
-	if (strictMcpConfigEnabled) extraArgs["strict-mcp-config"] = null;
-	// Opus 4.7 defaults thinking.display to "omitted" (empty thinking text in stream).
-	// Force summarized so thinking_delta events arrive. See anthropics/claude-agent-sdk-python#830.
-	if (effort) extraArgs["thinking-display"] = "summarized";
+	const extraArgs = buildProviderExtraArgs(cliModel, effort);
 
-	// Suppress claude.ai cloud MCP servers (Figma/Canva/etc. auto-discovered via OAuth
-	// when the user is logged into Anthropic). These are a separate code path from
-	// filesystem MCP and are NOT blocked by --strict-mcp-config or settingSources=undefined.
-	// The native CC binary gates them on env var ENABLE_CLAUDEAI_MCP_SERVERS: setting it
-	// to "0"/"false"/"no"/"off" makes the loader return early before any cloud fetch.
-	// DISABLE_AUTO_COMPACT=1: pi owns context-management and propagates its own
-	// /compact via session_compact (see handler in default export). Letting CC
-	// also autocompact would double-flush the prompt cache and races pi's
-	// threshold with CC's, including CC's anti-thrashing guard (issue #8).
-	// Manual /compact in CC still works (we never invoke it).
-	const childEnv = { ...process.env, ...CC_CHILD_ENV, ...getDebugProxyEnv() };
-	const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
+	const queryOptions = buildProviderQueryOptions({
 		cwd,
-		env: childEnv,
-		tools: [],
-		permissionMode: "bypassPermissions",
-		includePartialMessages: true,
-		// includeGitInstructions:false drops the gitStatus block from the preset.
-		// That block is the trailing suffix of the cached system block, and a
-		// git-state transition (new file, staging, commit) rewrites it — busting
-		// the prompt cache for the whole conversation from there on (see
-		// diag/probe-git-cache.mjs). The bridge re-invokes CC per turn, so this
-		// hit on every transition. Cost here is nil: the setting also strips
-		// CC's git-workflow guidance from its Bash tool prompt, but the provider
-		// path runs CC with `tools: []`, so those definitions never ship.
-		// AskClaude keeps CC's native tools and its guidance — unaffected.
-		settings: {
-			...claudeCodeSettings(providerSettings),
-			claudeMdExcludes: CLAUDE_MD_EXCLUDES,
-			includeGitInstructions: false,
-		},
-		// A side request's prompt replaces Claude Code's preset rather than appending to
-		// it: the caller wrote a complete prompt for a single narrow job, and the coding
-		// agent preset would talk it into being a coding agent.
-		systemPrompt: side
-			? context.systemPrompt
-			: {
-				type: "preset", preset: "claude_code",
-				append: systemPromptAppend ? systemPromptAppend : undefined,
-			},
+		model: cliModel,
+		side,
+		systemPromptAppend,
+		sideSystemPrompt: context.systemPrompt,
+		mcpServers,
+		effort,
 		extraArgs,
-		...(effort ? { effort } : {}),
-		...(mcpServers ? { mcpServers } : {}),
-		...(resumeSessionId ? { resume: resumeSessionId } : {}),
-		...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
-		...makeCliDebugOptions(side ? "side-request" : "provider"),
-	};
+		resumeSessionId: resumeSessionId ?? undefined,
+		claudeExecutable,
+	});
+
+	// The prefix a cache-warming probe has to reproduce exactly. Recorded for the
+	// real conversation path only — a side request serves its own throwaway
+	// session, and with no resumed session id there is no prefix to warm yet (a
+	// fresh conversation's first turn has nothing behind it).
+	if (!side && resumeSessionId) {
+		recordWarmSnapshot({
+			piSessionId,
+			ccSessionId: resumeSessionId,
+			cwd,
+			model: model.id,
+			cliModel,
+			effort,
+			systemPromptAppend,
+			mcpTools,
+		});
+	}
 
 	debug(side ? "provider: fresh side request" : "provider: fresh query",
 		`model=${cliModel} msgs=${context.messages.length} tools=${mcpTools.length}`,
@@ -3028,6 +3175,138 @@ export default function (pi: ExtensionAPI) {
 			return { cancel: true };
 		}
 	});
+
+	// --- Prompt-cache warming ---
+	//
+	// Pi's native warmer gives up after 30 idle minutes (see warm-scheduler.ts),
+	// which is shorter than the 1-hour cache Claude Code writes. This extension
+	// takes the job over while `cacheWarming.enabled` is true and hands it back by
+	// returning undefined here — pi's own decision then runs untouched.
+	pi.on("cache_warming_decision", () => {
+		if (config.cacheWarming?.enabled === true) return { action: "stop" as const };
+		return undefined;
+	});
+
+	// One in-flight probe per (pi session, model) key, so a cancel can stop a
+	// probe that is already running rather than only its next timer.
+	const warmReplayControllers = new Map<string, AbortController>();
+	// `ctx` is typed optional because these helpers sit behind event handlers that a
+	// host or a test stub may invoke with only the event: a throw here would surface
+	// as an extension error, and there is nothing to cancel or arm without a session.
+	const warmSessionIdOf = (ctx: ExtensionContext | undefined): string | null => ctx?.sessionManager?.getSessionId() ?? null;
+
+	configureWarmScheduler({
+		replay: async (state: WarmState) => {
+			const controller = new AbortController();
+			warmReplayControllers.set(state.key, controller);
+			try {
+				return await runWarmReplay({
+					snapshot: state.snapshot,
+					// Rebuilt from the real turn's own tool list: the request's tools block
+					// is part of the cached prefix, so a probe with different schemas reads
+					// nothing.
+					mcpServers: buildReplayMcpServers(state.snapshot.mcpTools),
+					extraArgs: buildProviderExtraArgs(state.snapshot.cliModel, state.snapshot.effort),
+					claudeExecutable: providerSettings.pathToClaudeCodeExecutable,
+					signal: controller.signal,
+				});
+			} finally {
+				warmReplayControllers.delete(state.key);
+			}
+		},
+		// A real turn is running: a probe would race its Claude Code process for the
+		// same session file, and the scheduler re-arms instead of firing.
+		isQueryActive: () => ctx().activeQuery !== null,
+		config: () => config.cacheWarming,
+		price: (modelId) => WARM_PRICES.get(modelId),
+		// The snapshot describes the request the turn sent through the session it
+		// resumed. Once that session is gone, rotated by a rebuild, or known to
+		// diverge from pi's history, the prefix it names is not the one the next real
+		// turn will read.
+		isStale: (snapshot) => {
+			const state = sessionStateFor(snapshot.piSessionId);
+			return !state || state.needsRebuild === true || state.sessionId !== snapshot.ccSessionId;
+		},
+		log: (message) => debug(message),
+	});
+
+	/** Arm (or re-arm) warming for a model an event belongs to, if that pair has
+	 *  a snapshot and the last turn's prompt is worth keeping. */
+	const armWarmingFor = (ctx: ExtensionContext | undefined, selected?: ExtensionContext["model"]): void => {
+		if (!ctx) return;
+		if (config.cacheWarming?.enabled !== true) return;
+		const model = selected ?? ctx.model;
+		if (!model || model.baseUrl !== "claude-bridge") return;
+		const piSessionId = warmSessionIdOf(ctx);
+		if (!piSessionId) return;
+		// The instance's own pi session only. A subagent's conversation is throwaway,
+		// so warming it would spend quota on a prefix nobody returns to.
+		if (!isOwnPiSession(piSessionId)) return;
+		const snapshot = getWarmSnapshot(piSessionId, model.id);
+		if (!snapshot) return;
+		armWarming({ piSessionId, model: model.id, snapshot, promptTokens: lastPromptTokens(ctx) });
+	};
+
+	/** Stop the window for the model an event belongs to (a real turn is about to
+	 *  race it). Other models' windows for the same session stay armed, so a model
+	 *  switch away and back is still warm. */
+	const stopWarmingFor = (ctx: ExtensionContext | undefined, reason: string): void => {
+		if (!ctx) return;
+		const piSessionId = warmSessionIdOf(ctx);
+		if (!piSessionId) return;
+		const modelId = ctx.model?.id;
+		if (!modelId) {
+			stopWarmingSession(piSessionId, reason);
+			return;
+		}
+		const key = warmKey(piSessionId, modelId);
+		warmReplayControllers.get(key)?.abort();
+		cancelWarmingKey(key, reason);
+	};
+
+	/** Stop every model's window for one pi session (its history was rewritten, or
+	 *  the session is coming or going). */
+	const stopWarmingSession = (piSessionId: string, reason: string): void => {
+		for (const state of warmStates()) {
+			if (state.piSessionId === piSessionId) warmReplayControllers.get(state.key)?.abort();
+		}
+		cancelWarmingSession(piSessionId, reason);
+	};
+
+	/** Stop everything this instance owns, in-flight probes included. */
+	const stopAllWarming = (reason: string): void => {
+		for (const controller of warmReplayControllers.values()) controller.abort();
+		warmReplayControllers.clear();
+		cancelAllWarming(reason);
+		warmSnapshots.clear();
+	};
+
+	// A real turn is starting; a probe already in flight would race it. turn_start
+	// fires per turn, so the window stays down for the whole run and is re-armed by
+	// the turn_end/agent_settled handlers below.
+	pi.on("before_agent_start", (_event, ctx) => stopWarmingFor(ctx, "agent run starting"));
+	pi.on("agent_start", (_event, ctx) => stopWarmingFor(ctx, "agent run starting"));
+	pi.on("turn_start", (_event, ctx) => stopWarmingFor(ctx, "turn starting"));
+	// A real turn just finished: this is the request worth keeping warm.
+	pi.on("turn_end", (_event, ctx) => armWarmingFor(ctx));
+	pi.on("agent_settled", (_event, ctx) => armWarmingFor(ctx));
+	// Deliberately no cancel: warming the newly selected model arms its own key,
+	// and the model just switched away from stays warm for the switch back.
+	pi.on("model_select", (event, ctx) => armWarmingFor(ctx, event.model));
+	pi.on("session_tree", (_event, ctx) => {
+		const piSessionId = warmSessionIdOf(ctx);
+		if (piSessionId) stopWarmingSession(piSessionId, "session tree changed");
+	});
+	pi.on("session_before_compact", (_event, ctx) => {
+		const piSessionId = warmSessionIdOf(ctx);
+		if (piSessionId) stopWarmingSession(piSessionId, "compaction");
+	});
+	// A session transition (/new, resume, a fresh process) retires every window in
+	// this module instance: the previous conversation's timers have nobody to warm
+	// anymore, and the process's session mirrors were just reset. session_shutdown
+	// is the same teardown for the whole instance.
+	pi.on("session_start", () => stopAllWarming("session_start"));
+	pi.on("session_shutdown", () => stopAllWarming("session_shutdown"));
 
 	// --- Provider ---
 	//

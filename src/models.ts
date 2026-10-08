@@ -46,11 +46,17 @@ export function buildModels<T extends { id: string; [key: string]: any }>(piAiMo
 		})
 		// Forward thinkingLevelMap so pi-ai's per-model overrides (e.g. opus-4-8
 		// mapping xhigh→xhigh and max→max) are visible to the effort lookup.
-		.map(({ id, name, reasoning, input, contextWindow, maxTokens, thinkingLevelMap }) => ({
+		// Forward promptCache so pi can schedule warming: without a declared
+		// lifetime, CacheWarmer.start stops with "cache lifetime unavailable"
+		// before any cache_warming_decision handler runs. Claude Code writes
+		// 1-hour caches exclusively (see diag/AUDIT.md), so declare only the long
+		// tier — a short entry would let pi schedule 4.5-minute refreshes.
+		.map(({ id, name, reasoning, input, contextWindow, maxTokens, thinkingLevelMap, promptCache }) => ({
 			id,
 			name,
 			reasoning, input, contextWindow, maxTokens,
 			thinkingLevelMap,
+			...(promptCache?.long !== undefined ? { promptCache: { long: promptCache.long } } : {}),
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		}));
 }

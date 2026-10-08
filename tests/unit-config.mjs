@@ -48,6 +48,7 @@ describe("loadConfig", () => {
 				compaction: {},
 				branchSummary: {},
 				webSearch: {},
+				cacheWarming: {},
 			});
 		} finally {
 			rmSync(cwd, { recursive: true, force: true });
@@ -77,6 +78,7 @@ describe("loadConfig", () => {
 				compaction: {},
 				branchSummary: {},
 				webSearch: {},
+				cacheWarming: {},
 			});
 		} finally {
 			rmSync(cwd, { recursive: true, force: true });
@@ -196,6 +198,7 @@ describe("loadConfig", () => {
 				compaction: {},
 				branchSummary: {},
 				webSearch: {},
+				cacheWarming: {},
 			});
 		} finally {
 			if (oldEnv === undefined) delete process.env.PI_CODING_AGENT_DIR;
