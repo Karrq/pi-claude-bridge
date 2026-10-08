@@ -78,6 +78,11 @@ Config: `~/.pi/agent/claude-bridge.json` (global) or the project Pi config direc
   },
   "branchSummary": {
     "takeover": true
+  },
+  "cacheWarming": {
+    "enabled": false,
+    "windowMinutes": 360,
+    "refreshMinutes": 54
   }
 }
 ```
@@ -112,6 +117,19 @@ Config: `~/.pi/agent/claude-bridge.json` (global) or the project Pi config direc
 - `takeover` (default `true`) — the same thing for `session_before_tree`, the summary pi generates when you rewind or fork-at-point with "summarize".
 
   Set to `false` only when another extension answers that event. Unlike `compaction.takeover`, falling through to pi's own path does **not** work on a bridge model: branch summaries run through the agent's stream function, so pi's internal branch-summary prompt reaches this provider having never been recorded by `before_agent_start`, and `resolveOrDerive` throws rather than silently sending Claude Code no context files, skills or instructions. Turn this off when something else owns branch summaries, not to get pi's native behaviour back.
+
+`cacheWarming`:
+- `enabled` (default `false`) — keep the shared Claude Code prompt cache warm between turns. Claude Code writes 1-hour caches, but pi's native warmer stops after 30 idle minutes, so without this a session left alone for an hour pays a full cache write on the next turn. While enabled the bridge takes warming over (pi's native warmer is vetoed) and re-sends the last real turn's request against a forked, non-persisted copy of the session every `refreshMinutes`, for up to `windowMinutes` after that turn. While disabled, pi's own warmer is completely untouched.
+- `windowMinutes` (default `360`) — how long after the last real turn to keep refreshing.
+- `refreshMinutes` (default `54`) — refresh cadence; keep it under the 60-minute cache lifetime. 54 matches the 90% margin pi's own warmer uses.
+- `minPromptTokens` (default `50000`) — don't warm prompts smaller than this; the read costs more than it saves.
+- `continuationProbability` (default `0.3`) — estimated chance that a real turn arrives before the cache expires. It weights the expected-savings gate.
+- `minExpectedSavings` (default `0.05`) — skip a refresh whose expected dollar saving is below this.
+- `maxReplays` (default `8`) — hard cap on refreshes per window, a quota guard.
+
+  Warming spends real tokens: each refresh is a cache read of the whole prompt plus one short answer. It stops itself for the window when a probe reads nothing back (the prefix diverged, so refreshes are paying write prices instead of read prices), and a refresh is skipped while a real turn is running. Windows are keyed per model, so switching models leaves the previous model's cache warm for the switch back.
+
+  `diag/probe-warm-replay.mjs` checks the whole path against a live session — two short turns, an idle wait past `refreshMinutes`, then one more real turn — and exits non-zero if the probe did not read the real prefix, or if that next turn did not read back what the probe refreshed.
 
 
 **Startup notice:** the first session lists `provider.plan` and `askClaude.enabled` if unset, then records `startupNoticeShown` in the global config so it doesn't nag again.

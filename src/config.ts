@@ -71,6 +71,32 @@ export interface Config {
 		// resolveOrDerive throws on it.
 		takeover?: boolean;
 	};
+	/**
+	 * Extension-owned prompt-cache warming. Pi's native warmer is capped at a
+	 * 30-minute idle window and a 60-minute streaming window (hardcoded in
+	 * dist/core/cache-warmer.js), so keeping a cache warm across a long idle gap
+	 * needs a scheduler of our own. While this is enabled the extension vetoes
+	 * pi's native warmer (cache_warming_decision -> stop); disable it and native
+	 * warming takes over unchanged.
+	 */
+	cacheWarming?: {
+		/** Master switch. Default false. */
+		enabled?: boolean;
+		/** Keep refreshing for this long after the last real turn. Default 360. */
+		windowMinutes?: number;
+		/** Refresh cadence, in minutes. Must stay under the 60-minute 1h cache TTL.
+		 *  Default 54 (90% of the TTL, matching pi's own margin). */
+		refreshMinutes?: number;
+		/** Skip warming below this prompt size (tokens). Default 50000. */
+		minPromptTokens?: number;
+		/** Estimated chance a real turn returns within the TTL; drives the
+		 *  expected-savings gate. Default 0.3. */
+		continuationProbability?: number;
+		/** Minimum expected dollar savings per refresh. Default 0.05. */
+		minExpectedSavings?: number;
+		/** Hard cap on refreshes per window, a quota guard. Default 8. */
+		maxReplays?: number;
+	};
 }
 
 export function tryParseJson(path: string): Partial<Config> {
@@ -126,5 +152,6 @@ export function loadConfig(cwd: string): Config {
 		compaction: { ...global.compaction, ...project.compaction },
 		branchSummary: { ...global.branchSummary, ...project.branchSummary },
 		webSearch: { ...global.webSearch, ...project.webSearch },
+		cacheWarming: { ...global.cacheWarming, ...project.cacheWarming },
 	};
 }
