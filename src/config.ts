@@ -96,6 +96,9 @@ export interface Config {
 		minExpectedSavings?: number;
 		/** Hard cap on refreshes per window, a quota guard. Default 8. */
 		maxReplays?: number;
+		/** Notify on each successful refresh (a toast with the window's run count)
+		 *  and record a `claude-bridge:cache-warm` session entry. Default true. */
+		notify?: boolean;
 	};
 }
 

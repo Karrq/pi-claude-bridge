@@ -101,6 +101,12 @@ export type WarmSchedulerDeps = {
 	price: (modelId: string) => WarmModelPrice | undefined;
 	/** Optional extra staleness test (e.g. the CC session pointer moved). */
 	isStale?: (snapshot: WarmSnapshot, now: number) => boolean;
+	/** Called after a probe refreshed the entry (cacheRead passed the hit floor),
+	 *  with the refreshed state and the economics the refresh was gated on. */
+	onRefreshed?: (state: WarmState, usage: WarmUsage, economics: WarmEconomics) => void;
+	/** Called whenever a window stops, with the reason. Callers filter to the
+	 *  reasons worth surfacing; most stops are routine (window elapsed). */
+	onStopped?: (state: WarmState, reason: string) => void;
 	now?: () => number;
 	log?: (message: string) => void;
 	setTimer?: (fn: () => void, ms: number) => WarmTimer;
@@ -184,6 +190,7 @@ function stop(state: WarmState, reason: string): void {
 	}
 	state.stopped = reason;
 	logOf(deps, `cache-warming: ${reason} (${shortLabel(state)})`);
+	deps?.onStopped?.(state, reason);
 }
 
 function schedule(state: WarmState, delayMs: number): void {
@@ -377,6 +384,7 @@ async function fire(state: WarmState): Promise<void> {
 		return;
 	}
 	logOf(d, `cache-warming: refreshed (${shortLabel(state)}) cacheRead=${usage.cacheRead} cacheWrite=${usage.cacheWrite} cacheWrite1h=${usage.cacheWrite1h}`);
+	d.onRefreshed?.(state, usage, economics);
 
 	const after = nowOf(d);
 	if (state.replays >= config.maxReplays) {
