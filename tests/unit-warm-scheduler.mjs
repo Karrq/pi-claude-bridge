@@ -41,6 +41,8 @@ function harness({ config = { enabled: true }, now: startNow = 1_000_000, usage 
 	const timers = [];
 	const replays = [];
 	const logs = [];
+	const refreshes = [];
+	const stops = [];
 	configureWarmScheduler({
 		replay: async (state) => { replays.push(state); return usage(state); },
 		isQueryActive: () => queryActive,
@@ -50,10 +52,12 @@ function harness({ config = { enabled: true }, now: startNow = 1_000_000, usage 
 		log: (message) => logs.push(message),
 		setTimer: (fn, ms) => { const timer = { fn, ms, cleared: false, fired: false }; timers.push(timer); return timer; },
 		clearTimer: (timer) => { timer.cleared = true; },
+		onRefreshed: (state, usage, economics) => { refreshes.push({ state, usage, economics }); },
+		onStopped: (state, reason) => { stops.push({ state, reason }); },
 		...overrides,
 	});
 	const h = {
-		timers, replays, logs,
+		timers, replays, logs, refreshes, stops,
 		advance(ms) { now += ms; },
 		get now() { return now; },
 		setQueryActive(value) { queryActive = value; },
@@ -158,8 +162,29 @@ describe("warm scheduler", () => {
 		assert.equal(h.replays.length, 1, "probes again once the turn is done");
 	});
 
-	it("stops the window when the probe reads nothing back (prefix diverged)", async () => {
+	it("reports each successful refresh with the window's run count", async () => {
+		const h = harness({ config: { enabled: true, maxReplays: 3 } });
+		const state = h.arm();
+		await h.fire();
+		assert.equal(h.refreshes.length, 1);
+		assert.equal(h.refreshes[0].state, state);
+		assert.equal(h.refreshes[0].state.replays, 1);
+		assert.equal(h.refreshes[0].usage.cacheRead, state.promptTokens);
+		h.advance(54 * 60_000);
+		await h.fire();
+		assert.equal(h.refreshes.length, 2, "the count climbs across a long absence");
+		assert.equal(h.refreshes[1].state.replays, 2);
+	});
+
+	it("reports a stop with its reason, and not as a refresh", async () => {
 		const h = harness({ usage: () => ({ cacheRead: 0, cacheWrite: 120_000, cacheWrite1h: 120_000 }) });
+		h.arm();
+		await h.fire();
+		assert.equal(h.refreshes.length, 0, "a rewrite is not a refresh");
+		assert.ok(h.stops.some((entry) => entry.reason.startsWith("prefix diverged")));
+	});
+
+	it("stops the window when the probe reads nothing back (prefix diverged)", async () => {		const h = harness({ usage: () => ({ cacheRead: 0, cacheWrite: 120_000, cacheWrite1h: 120_000 }) });
 		const state = h.arm();
 		await h.fire();
 		assert.match(state.stopped, /prefix diverged/);

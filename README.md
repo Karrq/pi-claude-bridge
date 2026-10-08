@@ -126,8 +126,9 @@ Config: `~/.pi/agent/claude-bridge.json` (global) or the project Pi config direc
 - `continuationProbability` (default `0.3`) — estimated chance that a real turn arrives before the cache expires. It weights the expected-savings gate.
 - `minExpectedSavings` (default `0.05`) — skip a refresh whose expected dollar saving is below this.
 - `maxReplays` (default `8`) — hard cap on refreshes per window, a quota guard.
+- `notify` (default `true`) — show a toast on each successful refresh (with the window's run count, e.g. `x3 this window`) and write a `claude-bridge:cache-warm` entry to the session for auditing. Set to `false` to keep warming silent. A diverged prefix or a failed probe is always surfaced as a warning.
 
-  Warming spends real tokens: each refresh is a cache read of the whole prompt plus one short answer. It stops itself for the window when a probe reads nothing back (the prefix diverged, so refreshes are paying write prices instead of read prices), and a refresh is skipped while a real turn is running. Windows are keyed per model, so switching models leaves the previous model's cache warm for the switch back.
+  Warming spends real tokens: each refresh is a cache read of the whole prompt plus one short answer. It stops itself for the window when a probe reads nothing back (the prefix diverged, so refreshes are paying write prices instead of read prices), and a refresh is skipped while a real turn is streaming — but not while a tool is running, since a parked query is a safe moment to probe. That, plus arming on `tool_execution_start`, is what keeps the cache warm through a single tool call that runs longer than the refresh cadence. Windows are keyed per model, so switching models leaves the previous model's cache warm for the switch back.
 
   `diag/probe-warm-replay.mjs` checks the whole path against a live session — two short turns, an idle wait past `refreshMinutes`, then one more real turn — and exits non-zero if the probe did not read the real prefix, or if that next turn did not read back what the probe refreshed.
 

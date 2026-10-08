@@ -3215,8 +3215,10 @@ export default function (pi: ExtensionAPI) {
 			}
 		},
 		// A real turn is running: a probe would race its Claude Code process for the
-		// same session file, and the scheduler re-arms instead of firing.
-		isQueryActive: () => ctx().activeQuery !== null,
+		// same session file, and the scheduler re-arms instead of firing. A parked
+		// query (pendingToolCalls non-empty) is not running — Claude Code is waiting
+		// for pi to deliver a tool result, so the prefix is frozen and a probe is safe.
+		isQueryActive: () => ctx().activeQuery !== null && ctx().pendingToolCalls.size === 0,
 		config: () => config.cacheWarming,
 		price: (modelId) => WARM_PRICES.get(modelId),
 		// The snapshot describes the request the turn sent through the session it
@@ -3228,6 +3230,34 @@ export default function (pi: ExtensionAPI) {
 			return !state || state.needsRebuild === true || state.sessionId !== snapshot.ccSessionId;
 		},
 		log: (message) => debug(message),
+		// Success is surfaced because warming otherwise runs entirely behind the
+		// scenes: a probe is not part of pi's transcript, so without this the only
+		// evidence is the debug log. The run count is what tells a long absence
+		// (many refreshes) from a quick return (one).
+		onRefreshed: (state, usage) => {
+			if (config.cacheWarming?.notify === false) return;
+			piUI?.notify(
+				`claude-bridge: cache warmed (${usage.cacheRead.toLocaleString("en-US")} tokens read, x${state.replays} this window)`,
+				"info",
+			);
+			pi.appendEntry("claude-bridge:cache-warm", {
+				piSessionId: state.piSessionId,
+				model: state.model,
+				promptTokens: state.promptTokens,
+				cacheRead: usage.cacheRead,
+				cacheWrite: usage.cacheWrite,
+				cacheWrite1h: usage.cacheWrite1h,
+				replays: state.replays,
+				at: Date.now(),
+			});
+		},
+		// Only the stops that mean warming is not working are worth surfacing.
+		// Everything else (window elapsed, maxReplays, disabled, a prompt too small
+		// to be worth keeping) is routine.
+		onStopped: (state, reason) => {
+			if (!reason.startsWith("prefix diverged") && !reason.startsWith("replay failed")) return;
+			piUI?.notify(`claude-bridge: cache warming stopped for ${state.model} — ${reason}`, "warning");
+		},
 	});
 
 	/** Arm (or re-arm) warming for a model an event belongs to, if that pair has
@@ -3282,11 +3312,17 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	// A real turn is starting; a probe already in flight would race it. turn_start
-	// fires per turn, so the window stays down for the whole run and is re-armed by
-	// the turn_end/agent_settled handlers below.
+	// fires per turn, so the window is down while the model streams; it is re-armed
+	// by the handlers below.
 	pi.on("before_agent_start", (_event, ctx) => stopWarmingFor(ctx, "agent run starting"));
 	pi.on("agent_start", (_event, ctx) => stopWarmingFor(ctx, "agent run starting"));
 	pi.on("turn_start", (_event, ctx) => stopWarmingFor(ctx, "turn starting"));
+	// turn_end fires only after the turn's tools have run (agent-loop.js emits it
+	// with their results), so a tool that runs for an hour would leave the window
+	// down for that whole hour. tool_execution_start closes that gap: it fires once
+	// the tool request has been issued, while the query is parked, and the
+	// scheduler's isQueryActive treats a parked query as free to probe.
+	pi.on("tool_execution_start", (_event, ctx) => armWarmingFor(ctx));
 	// A real turn just finished: this is the request worth keeping warm.
 	pi.on("turn_end", (_event, ctx) => armWarmingFor(ctx));
 	pi.on("agent_settled", (_event, ctx) => armWarmingFor(ctx));
