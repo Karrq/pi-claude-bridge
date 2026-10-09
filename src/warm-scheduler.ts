@@ -74,6 +74,8 @@ export type WarmState = {
 	promptTokens: number;
 	armedAt: number;
 	windowEndsAt: number;
+	/** Wall-clock time of the next scheduled probe, while one is scheduled. */
+	nextFireAt?: number;
 	replays: number;
 	timer?: WarmTimer;
 	/** Why this state stopped scheduling; set by cancel and by every stop path. */
@@ -189,6 +191,7 @@ function stop(state: WarmState, reason: string): void {
 		state.timer = undefined;
 	}
 	state.stopped = reason;
+	state.nextFireAt = undefined;
 	logOf(deps, `cache-warming: ${reason} (${shortLabel(state)})`);
 	deps?.onStopped?.(state, reason);
 }
@@ -198,6 +201,7 @@ function schedule(state: WarmState, delayMs: number): void {
 	if (!d) return;
 	if (state.timer) clearTimerOf(d, state.timer);
 	state.stopped = undefined;
+	state.nextFireAt = nowOf(d) + delayMs;
 	state.timer = setTimerOf(d, () => { void fire(state); }, delayMs);
 }
 
@@ -407,6 +411,7 @@ export function cancelKey(key: string, reason: string): void {
 		state.timer = undefined;
 	}
 	state.stopped = reason;
+	state.nextFireAt = undefined;
 	logOf(deps, `cache-warming: cancelled (${shortLabel(state)}) — ${reason}`);
 }
 
@@ -438,4 +443,9 @@ export function cancelAll(reason: string): void {
 /** Live windows, for tests and diagnostics. */
 export function warmStates(): WarmState[] {
 	return [...states.values()];
+}
+
+/** One window for a (pi session, model) pair, or undefined when none is armed. */
+export function warmStateFor(piSessionId: string, model: string): WarmState | undefined {
+	return states.get(keyOf(piSessionId, model));
 }

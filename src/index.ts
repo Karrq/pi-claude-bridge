@@ -39,7 +39,9 @@ import {
 	configureWarmScheduler,
 	warmKey,
 	warmPriceMap,
+	warmStateFor,
 	warmStates,
+	WARM_DEFAULTS,
 	type WarmSnapshot,
 	type WarmState,
 } from "./warm-scheduler.js";
@@ -3182,8 +3184,14 @@ export default function (pi: ExtensionAPI) {
 	// which is shorter than the 1-hour cache Claude Code writes. This extension
 	// takes the job over while `cacheWarming.enabled` is true and hands it back by
 	// returning undefined here — pi's own decision then runs untouched.
+	//
+	// /warm and /unwarm override that config for this session only; undefined means
+	// follow the config. Nothing persists, so a new session starts from the config
+	// again. Warming still only ever arms for a claude-bridge model.
+	let warmSessionOverride: boolean | undefined;
+	const warmingEnabled = (): boolean => warmSessionOverride ?? config.cacheWarming?.enabled === true;
 	pi.on("cache_warming_decision", () => {
-		if (config.cacheWarming?.enabled === true) return { action: "stop" as const };
+		if (warmingEnabled()) return { action: "stop" as const };
 		return undefined;
 	});
 
@@ -3219,7 +3227,7 @@ export default function (pi: ExtensionAPI) {
 		// query (pendingToolCalls non-empty) is not running — Claude Code is waiting
 		// for pi to deliver a tool result, so the prefix is frozen and a probe is safe.
 		isQueryActive: () => ctx().activeQuery !== null && ctx().pendingToolCalls.size === 0,
-		config: () => config.cacheWarming,
+		config: () => ({ ...config.cacheWarming, enabled: warmingEnabled() }),
 		price: (modelId) => WARM_PRICES.get(modelId),
 		// The snapshot describes the request the turn sent through the session it
 		// resumed. Once that session is gone, rotated by a rebuild, or known to
@@ -3234,10 +3242,11 @@ export default function (pi: ExtensionAPI) {
 		// scenes: a probe is not part of pi's transcript, so without this the only
 		// evidence is the debug log. The run count is what tells a long absence
 		// (many refreshes) from a quick return (one).
-		onRefreshed: (state, usage) => {
+		onRefreshed: (state, usage, economics) => {
 			if (config.cacheWarming?.notify === false) return;
+			const keptWarm = economics.warmCost * state.replays;
 			piUI?.notify(
-				`claude-bridge: cache warmed (${usage.cacheRead.toLocaleString("en-US")} tokens read, x${state.replays} this window)`,
+				`claude-bridge: cache warmed (${usage.cacheRead.toLocaleString("en-US")} tokens read, x${state.replays} this window) — warming ${formatUsd(economics.warmCost)}/refresh (${formatUsd(keptWarm)} so far), cold ${formatUsd(economics.missCost)}`,
 				"info",
 			);
 			pi.appendEntry("claude-bridge:cache-warm", {
@@ -3248,6 +3257,9 @@ export default function (pi: ExtensionAPI) {
 				cacheWrite: usage.cacheWrite,
 				cacheWrite1h: usage.cacheWrite1h,
 				replays: state.replays,
+				warmCost: economics.warmCost,
+				missCost: economics.missCost,
+				expectedSavings: economics.expectedSavings,
 				at: Date.now(),
 			});
 		},
@@ -3264,7 +3276,7 @@ export default function (pi: ExtensionAPI) {
 	 *  a snapshot and the last turn's prompt is worth keeping. */
 	const armWarmingFor = (ctx: ExtensionContext | undefined, selected?: ExtensionContext["model"]): void => {
 		if (!ctx) return;
-		if (config.cacheWarming?.enabled !== true) return;
+		if (!warmingEnabled()) return;
 		const model = selected ?? ctx.model;
 		if (!model || model.baseUrl !== "claude-bridge") return;
 		const piSessionId = warmSessionIdOf(ctx);
@@ -3310,6 +3322,50 @@ export default function (pi: ExtensionAPI) {
 		cancelAllWarming(reason);
 		warmSnapshots.clear();
 	};
+
+	/** Dollars to four places: probing a 100k-token prompt costs cents, not dollars. */
+	const formatUsd = (value: number): string => `$${value.toFixed(4)}`;
+	const warmRefreshMinutes = (): number => config.cacheWarming?.refreshMinutes ?? WARM_DEFAULTS.refreshMinutes;
+
+	/** When the next probe is, or what has to happen first. Reads the live window
+	 *  so the answer reflects work already scheduled rather than a bare config value. */
+	const describeNextWarm = (piSessionId: string | null, modelId: string | undefined): string => {
+		const state = piSessionId && modelId ? warmStateFor(piSessionId, modelId) : undefined;
+		if (state?.nextFireAt) {
+			const minutes = Math.max(0, Math.round((state.nextFireAt - Date.now()) / 60_000));
+			return `next probe in ~${minutes} min (${new Date(state.nextFireAt).toLocaleTimeString()})`;
+		}
+		return `first probe ~${warmRefreshMinutes()} min after the next turn`;
+	};
+
+	// Session-scoped toggles. /warm is the config's `cacheWarming.enabled` for this
+	// session only; /unwarm stops it and leaves pi's native warmer to decide.
+	pi.registerCommand("warm", {
+		description: "Warm the Claude Code prompt cache for this session (claude-bridge models only)",
+		handler: async (_args, ctx) => {
+			if (ctx.model?.baseUrl !== "claude-bridge") {
+				ctx.ui?.notify?.("claude-bridge: /warm applies only to claude-bridge models", "warning");
+				return;
+			}
+			const wasEnabled = warmingEnabled();
+			warmSessionOverride = true;
+			armWarmingFor(ctx);
+			ctx.ui?.notify?.(
+				`claude-bridge: cache warming ${wasEnabled ? "still enabled" : "enabled for this session"} — ${describeNextWarm(warmSessionIdOf(ctx), ctx.model.id)}`,
+				"info",
+			);
+		},
+	});
+
+	pi.registerCommand("unwarm", {
+		description: "Stop warming the Claude Code prompt cache for this session",
+		handler: async (_args, ctx) => {
+			warmSessionOverride = false;
+			const piSessionId = warmSessionIdOf(ctx);
+			if (piSessionId) stopWarmingSession(piSessionId, "disabled by /unwarm");
+			ctx.ui?.notify?.("claude-bridge: cache warming disabled for this session", "info");
+		},
+	});
 
 	// A real turn is starting; a probe already in flight would race it. turn_start
 	// fires per turn, so the window is down while the model streams; it is re-armed

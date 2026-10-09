@@ -98,7 +98,16 @@ describe("warm scheduler", () => {
 		assert.equal(state.replays, 0);
 		assert.equal(state.stopped, undefined);
 		assert.equal(h.pending().ms, 54 * 60_000);
+		assert.equal(state.nextFireAt, h.now + 54 * 60_000, "the next probe time is readable while armed");
 		assert.equal(state.windowEndsAt, h.now + 360 * 60_000);
+	});
+
+	it("forgets the next fire time once the window is cancelled", () => {
+		const h = harness();
+		const state = h.arm();
+		assert.ok(state.nextFireAt);
+		cancelKey(state.key, "session ended");
+		assert.equal(state.nextFireAt, undefined);
 	});
 
 	it("applies documented defaults when the config omits them", () => {
