@@ -18,6 +18,7 @@ const { default: activate } = await import("../../src/index.js");
 
 export function activateWithMockPi(activateFn) {
 	const handlers = new Map();
+	const commands = new Map();
 	const compose = (previous, handler) => (eventArg, ctx = {}) => {
 		const result = handler(eventArg, ctx);
 		// Promise-aware but not promise-forcing: the capture tests call these handlers
@@ -34,6 +35,8 @@ export function activateWithMockPi(activateFn) {
 		},
 		registerProvider: () => {},
 		registerTool: () => {},
+		registerCommand: (name, options) => { commands.set(name, options); },
 	});
+	handlers.commands = commands;
 	return handlers;
 }
