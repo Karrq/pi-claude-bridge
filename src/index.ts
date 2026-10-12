@@ -353,11 +353,32 @@ export function warmSnapshotKey(piSessionId: string, modelId: string): string {
 	return `${piSessionId}\u0000${modelId}`;
 }
 
+/** Whether two snapshots describe the same cached prefix: the fields a probe must
+ *  reproduce. `at` is excluded because it changes every turn without changing the
+ *  request, and `piSessionId` is already the map key. */
+function sameWarmShape(next: Omit<WarmSnapshot, "at">, previous: WarmSnapshot): boolean {
+	return next.ccSessionId === previous.ccSessionId
+		&& next.cwd === previous.cwd
+		&& next.model === previous.model
+		&& next.cliModel === previous.cliModel
+		&& next.effort === previous.effort
+		&& next.systemPromptAppend === previous.systemPromptAppend
+		&& JSON.stringify(next.mcpTools) === JSON.stringify(previous.mcpTools);
+}
+
 /** Record (or replace) the parameters of the request a real turn just sent. */
 function recordWarmSnapshot(input: Omit<WarmSnapshot, "at">): void {
+	const key = warmSnapshotKey(input.piSessionId, input.model);
+	const previous = warmSnapshots.get(key);
 	const snapshot: WarmSnapshot = { ...input, at: Date.now() };
-	warmSnapshots.set(warmSnapshotKey(input.piSessionId, input.model), snapshot);
+	warmSnapshots.set(key, snapshot);
 	debug(`warm-snapshot: recorded ${input.piSessionId.slice(0, 8)}/${input.model} session=${input.ccSessionId.slice(0, 8)} tools=${input.mcpTools.length} effort=${input.effort ?? "default"} append=${input.systemPromptAppend?.length ?? 0} chars`);
+	// Only this process's own pi session: a subagent AgentSession sharing the process
+	// writes into its parent's transcript otherwise. Only when the shape changes, so a
+	// long run does not grow the session with one entry per turn.
+	if (isOwnPiSession(input.piSessionId) && (!previous || !sameWarmShape(input, previous))) {
+		extensionApi?.appendEntry(WARM_SNAPSHOT_ENTRY_TYPE, snapshot);
+	}
 }
 
 /** The snapshot this extension has for a (pi session, model) pair, or undefined
@@ -463,6 +484,14 @@ function sponsorMarkRebuildForSession(piSession: string | null, event: string): 
 // recover the CC session pointer instead of unconditionally starting over.
 // See recoverSharedSessionFromEntries and claimLease.
 const CC_SESSION_ENTRY_TYPE = "claude-bridge:cc-session";
+
+// The request shape of a real turn, persisted into the pi session that sent it so
+// another process can see what a warm probe would have to reproduce. A pi-subagent
+// child is its own pi process, and the parent that spawned it has no way to know the
+// child's CC session, system-prompt append, tool schemas or effort; this entry is that
+// handover. Written whenever the shape changes (not per turn), and independent of
+// cacheWarming so the data is there while warming is off.
+const WARM_SNAPSHOT_ENTRY_TYPE = "claude-bridge:warm-snapshot";
 
 function sessionLockPath(sessionId: string, cwd: string): string {
 	return `${getSessionPath(sessionId, cwd, process.env.CLAUDE_CONFIG_DIR)}.lock`;
@@ -1162,6 +1191,8 @@ export const __test = {
 	setOwnPiSessionId(piSessionId: string | null) {
 		ownPiSessionId = piSessionId;
 	},
+	recordWarmSnapshot,
+	getWarmSnapshot,
 	getHeldLease() {
 		return heldLease;
 	},
