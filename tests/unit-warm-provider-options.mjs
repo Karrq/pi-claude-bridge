@@ -30,7 +30,7 @@ describe("buildProviderQueryOptions", () => {
 		assert.deepEqual(options.tools, [], "tools stays empty; tool schemas come from mcpServers");
 		assert.deepEqual(options.settings, {
 			autoMemoryEnabled: false,
-			claudeMdExcludes: ["**/CLAUDE.md", "**/.claude/rules/**"],
+			claudeMdExcludes: ["**/CLAUDE.md", "**/AGENTS.md", "**/.claude/rules/**"],
 			includeGitInstructions: false,
 		});
 		assert.deepEqual(options.systemPrompt, { type: "preset", preset: "claude_code", append: "APPEND" });

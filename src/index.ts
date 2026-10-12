@@ -9,7 +9,7 @@ import { createSession, deleteSession, getSessionPath, openSession, repairToolPa
 import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
-import { DEBUG_LOG_PATH, DIAG_LOG_PATH } from "./log-paths.js";
+import { debugLogPath, diagLogPath } from "./log-paths.js";
 import { applyLongContext, buildModels, claudeCodeModelId, type LongContextSettings, resolveModel as _resolveModel } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, renderSkillsBlock } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
@@ -53,12 +53,6 @@ import { buildReplayMcpServers, runWarmReplay } from "./warm-replay.js";
 
 const DEBUG = process.env.CLAUDE_BRIDGE_DEBUG === "1";
 
-// CLAUDE_BRIDGE_RECORD_STREAM=<path> appends every SDK message consumeQuery sees,
-// one JSON object per line. Used by tests/lib/record-sdk-streams.mjs to capture
-// replay fixtures, so unit tests assert against message shapes Claude Code really
-// emitted rather than ones we imagined.
-const RECORD_STREAM_PATH = process.env.CLAUDE_BRIDGE_RECORD_STREAM;
-
 // Applied to every Claude Code subprocess the bridge spawns — provider, AskClaude
 // and the compact summary. One place, so a guard is added once rather than three
 // times, and so a missing one is visible.
@@ -80,31 +74,22 @@ const CC_CHILD_ENV = {
 } as const;
 
 // Pi owns context files on the provider path, so Claude Code must not load its
-// own on top: otherwise a project CLAUDE.md arrives twice, and the user's
-// ~/.claude/CLAUDE.md — a persona written for a harness that is not the one
-// running — arrives at all, stamped "These instructions OVERRIDE any default
+// own on top: otherwise project CLAUDE.md/AGENTS.md files arrive twice, and
+// ~/.claude/CLAUDE.md — a user persona written for a harness that is not the
+// one running — arrives at all, stamped "These instructions OVERRIDE any default
 // behavior" and outranking Pi's own AGENTS.md.
 //
 // Excludes rather than settingSources: the source gate that suppresses CLAUDE.md
 // is the same one that reads settings.json, where Bedrock/Vertex users keep
 // `env` and `apiKeyHelper`. Patterns are matched with picomatch against absolute
-// paths; "**/CLAUDE.md" covers the user, ancestor, project and .claude/ copies,
+// paths; the filename globs cover user, ancestor, project and .claude/ copies,
 // while rules need their own. Managed/policy memory is not excludable by design.
-const CLAUDE_MD_EXCLUDES = ["**/CLAUDE.md", "**/.claude/rules/**"];
+const CLAUDE_MD_EXCLUDES = ["**/CLAUDE.md", "**/AGENTS.md", "**/.claude/rules/**"];
 
 // The `model` Claude Code stamps on an assistant message it fabricated itself
 // rather than received from the API. Its own source keys on this exact string to
 // exclude such messages from turn history; no real completion carries it.
 const SYNTHETIC_MODEL = "<synthetic>";
-
-// Ensure the debug log directory exists when debug is enabled
-if (DEBUG) {
-	try {
-		mkdirSync(dirname(DEBUG_LOG_PATH), { recursive: true });
-	} catch {
-		// If directory creation fails, debug functions will throw on first use
-	}
-}
 
 // Unique per module evaluation — confirms whether subagents share module state
 const moduleInstanceId = Math.random().toString(36).slice(2, 8);
@@ -113,6 +98,8 @@ const moduleInstanceId = Math.random().toString(36).slice(2, 8);
 // through the same DEBUG gate rather than growing their own log plumbing.
 export function debug(...args: unknown[]) {
 	if (!DEBUG) return;
+	const logPath = debugLogPath();
+	try { mkdirSync(dirname(logPath), { recursive: true }); } catch { /* ignore */ }
 	const ts = new Date().toISOString();
 	const fmt = (a: unknown): string => {
 		if (typeof a === "string") return a;
@@ -120,7 +107,7 @@ export function debug(...args: unknown[]) {
 		return JSON.stringify(a);
 	};
 	const msg = args.map(fmt).join(" ");
-	appendFileSync(DEBUG_LOG_PATH, `[${ts}] [${moduleInstanceId}] ${msg}\n`);
+	appendFileSync(logPath, `[${ts}] [${moduleInstanceId}] ${msg}\n`);
 }
 
 // Per-query CLI debug capture. When CLAUDE_BRIDGE_DEBUG=1, ask the Claude Code
@@ -134,7 +121,7 @@ function makeCliDebugOptions(tag: string): { debug?: boolean; debugFile?: string
 	if (!DEBUG) return {};
 	const seq = nextCliDebugSeq++;
 	const ts = new Date().toISOString().replace(/[:.]/g, "-");
-	const logDir = join(dirname(DEBUG_LOG_PATH), "cc-cli-logs");
+	const logDir = join(dirname(debugLogPath()), "cc-cli-logs");
 	try { mkdirSync(logDir, { recursive: true }); } catch { /* ignore */ }
 	const debugFile = join(logDir, `${ts}-${tag}-${seq}.log`);
 	debug(`cli-debug: ${tag} #${seq} → ${debugFile}`);
@@ -154,9 +141,10 @@ function makeCliDebugOptions(tag: string): { debug?: boolean; debugFile?: string
 function diagDump(label: string, data: Record<string, unknown>) {
 	const ts = new Date().toISOString();
 	const entry = { ts, moduleInstanceId, label, ...data };
-	mkdirSync(dirname(DIAG_LOG_PATH), { recursive: true });
-	appendFileSync(DIAG_LOG_PATH, JSON.stringify(entry) + "\n");
-	debug(`DIAG: ${label} (see ${DIAG_LOG_PATH})`);
+	const logPath = diagLogPath();
+	mkdirSync(dirname(logPath), { recursive: true });
+	appendFileSync(logPath, JSON.stringify(entry) + "\n");
+	debug(`DIAG: ${label} (see ${logPath})`);
 }
 
 // --- Constants ---
@@ -942,7 +930,7 @@ function verifyWrittenSession(
 			`Session file issue: ${msg}\n` +
 			`cwd=${cwd} realpath=${safeRealpath(cwd)} CLAUDE_CONFIG_DIR=${process.env.CLAUDE_CONFIG_DIR ?? "(unset)"}\n` +
 			`Please copy and paste this message into a new issue at https://github.com/elidickinson/pi-claude-bridge/issues/new` +
-			(DEBUG ? ` and attach ${DEBUG_LOG_PATH}` : ` (rerun with CLAUDE_BRIDGE_DEBUG=1 to capture a debug log)`),
+			(DEBUG ? ` and attach ${debugLogPath()}` : ` (rerun with CLAUDE_BRIDGE_DEBUG=1 to capture a debug log)`),
 			"warning",
 		);
 		diagDump("session_verify_fail", { msg, jsonlPath, cwd, realpath: safeRealpath(cwd), claudeConfigDir: process.env.CLAUDE_CONFIG_DIR ?? null });
@@ -1686,7 +1674,17 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 	// skips this marker the same way (alongside isApiErrorMessage/isVirtual, which
 	// do not survive to the SDK stream), and no healthy turn carries it — pinned in
 	// tests/int-cc-contracts.mjs, measured by diag/probe-synthetic-error.mjs.
+	//
+	// It must also stay off the stream: a consumer that fails over only before output
+	// commits (pi-model-fallback-alias) cannot reach the next provider if the report
+	// counts as output (issue #162).
 	if (assistantMsg.model === SYNTHETIC_MODEL) {
+		// The report can follow a stalled stream whose non-streaming retry also failed;
+		// drop the abandoned partial blocks (unsigned thinking, a tool call CC will never
+		// dispatch) the way the fallback path below would.
+		if (c.turnSawStreamEvent && c.turnStreamOpen) dropAbandonedStreamBlocks(c, "synthetic failure report");
+		// Usage still counts: the request that produced the report was paid for.
+		if (assistantMsg.usage && c.turnOutput) recordUsage(c.turnOutput, assistantMsg.usage, model);
 		debug(`processAssistantMessage: skipping synthetic failure narration (${assistantMsg.content.length} blocks)`);
 		return;
 	}
@@ -1765,7 +1763,12 @@ async function consumeQuery(
 	let capturedSessionId: string | undefined;
 
 	for await (const message of sdkQuery) {
-		if (RECORD_STREAM_PATH) appendFileSync(RECORD_STREAM_PATH, `${JSON.stringify(message)}\n`);
+		// CLAUDE_BRIDGE_RECORD_STREAM=<path> appends every SDK message consumeQuery
+		// sees, one JSON object per line. Used by tests/lib/record-sdk-streams.mjs to
+		// capture replay fixtures, so unit tests assert against message shapes Claude
+		// Code really emitted rather than ones we imagined.
+		const recordStreamPath = process.env.CLAUDE_BRIDGE_RECORD_STREAM;
+		if (recordStreamPath) appendFileSync(recordStreamPath, `${JSON.stringify(message)}\n`);
 		if (wasAborted()) break;
 		// Everything below the currentPiStream guard is content, which there is
 		// nowhere to put once a turn has ended on a tool call. These three are not
@@ -3031,7 +3034,7 @@ export default function (pi: ExtensionAPI) {
 	// Code's preset carries its own tool and permission guidance that the bridge
 	// still depends on, so both flags are forwarded as an append.
 	//
-	// The options (custom/append/contextFiles/skills) are pi config, stable across a
+	// The options (custom/append/contextFiles/skills/sections) are pi config, stable across a
 	// turn; only the auto-generated tool list in the rendered prompt varies. Stash them
 	// at before_agent_start so the agent_start recording below can reuse them.
 	type RecordOptions = Parameters<typeof recordSystemPrompt>[2];
@@ -3042,6 +3045,7 @@ export default function (pi: ExtensionAPI) {
 		appendSystemPrompt?: string;
 		contextFiles?: { path: string; content: string }[];
 		skills?: Parameters<typeof promptCaptures.record>[1]["skills"];
+		sections?: Record<string, string>;
 		selectedTools?: string[];
 	} | undefined) {
 		if (!systemPrompt) return;
@@ -3059,6 +3063,7 @@ export default function (pi: ExtensionAPI) {
 			append: options?.appendSystemPrompt,
 			contextFiles: options?.contextFiles ?? [],
 			skills: hasRead ? options?.skills ?? [] : [],
+			sections: options?.sections,
 		}, source);
 	}
 	pi.on("before_agent_start", (event) => {
