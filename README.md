@@ -131,6 +131,8 @@ Config: `~/.pi/agent/claude-bridge.json` (global) or the project Pi config direc
 
   Warming spends real tokens: each refresh is a cache read of the whole prompt plus one short answer. It stops itself for the window when a probe reads nothing back (the prefix diverged, so refreshes are paying write prices instead of read prices), and a refresh is skipped while a real turn is streaming — but not while a tool is running, since a parked query is a safe moment to probe. That, plus arming on `tool_execution_start`, is what keeps the cache warm through a single tool call that runs longer than the refresh cadence. Windows are keyed per model, so switching models leaves the previous model's cache warm for the switch back.
 
+  Every real turn also writes a `claude-bridge:warm-snapshot` entry into the session (only when the request shape changes, and even while warming is off) with the Claude Code session id, cwd, model ids, effort, system-prompt append and MCP tool schemas a probe must reproduce. That is not needed for the bridge's own warming, which keeps the shape in memory; it is the handover for a process that owns a different pi session, such as the parent of a pi-subagent child.
+
   `diag/probe-warm-replay.mjs` checks the whole path against a live session — two short turns, an idle wait past `refreshMinutes`, then one more real turn — and exits non-zero if the probe did not read the real prefix, or if that next turn did not read back what the probe refreshed.
 
 
