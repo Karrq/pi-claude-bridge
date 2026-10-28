@@ -78,6 +78,7 @@ describe("buildProviderExtraArgs", () => {
 	it("always names the CLI model and pins the MCP config", () => {
 		assert.deepEqual(buildProviderExtraArgs("claude-sonnet-5-5", undefined), {
 			model: "claude-sonnet-5-5",
+			"replay-user-messages": null,
 			"strict-mcp-config": null,
 		});
 	});
@@ -85,6 +86,7 @@ describe("buildProviderExtraArgs", () => {
 	it("asks for summarized thinking only when an effort level is sent", () => {
 		assert.deepEqual(buildProviderExtraArgs("claude-opus-5", "high"), {
 			model: "claude-opus-5",
+			"replay-user-messages": null,
 			"strict-mcp-config": null,
 			"thinking-display": "summarized",
 		});

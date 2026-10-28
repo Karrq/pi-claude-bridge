@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readFileSync } from "node:fs";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { claudeCodeSettings, loadConfig, markStartupNoticeShown } from "../src/config.js";
+import { claudeCodeSettings, loadConfig, markAskClaudeDeprecationNoticeShown, markStartupNoticeShown } from "../src/config.js";
 
 function withTempHome(fn) {
 	const oldHome = process.env.HOME;
@@ -47,10 +47,9 @@ describe("loadConfig", () => {
 
 			assert.deepEqual(loadConfig(cwd), {
 				startupNoticeShown: undefined,
+				askClaudeDeprecationShown: undefined,
 				provider: { plan: "max" },
 				askClaude: { enabled: false },
-				compaction: {},
-				branchSummary: {},
 				webSearch: {},
 				cacheWarming: {},
 			});
@@ -77,65 +76,12 @@ describe("loadConfig", () => {
 
 			assert.deepEqual(loadConfig(cwd), {
 				startupNoticeShown: undefined,
+				askClaudeDeprecationShown: undefined,
 				provider: { plan: "max", strictMcpConfig: true, autoMemoryEnabled: true },
 				askClaude: { enabled: false, defaultMode: "read" },
-				compaction: {},
-				branchSummary: {},
 				webSearch: {},
 				cacheWarming: {},
 			});
-		} finally {
-			rmSync(cwd, { recursive: true, force: true });
-		}
-	}));
-
-	it("merges takeover flags with project overriding global", () => withTempHome(() => {
-		const cwd = mkdtempSync(join(tmpdir(), "claude-bridge-project-"));
-		try {
-			const globalDir = getAgentDir();
-			const projectDir = join(cwd, CONFIG_DIR_NAME);
-			mkdirSync(globalDir, { recursive: true });
-			mkdirSync(projectDir, { recursive: true });
-			writeFileSync(join(globalDir, "claude-bridge.json"), JSON.stringify({
-				compaction: { takeover: true },
-				branchSummary: { takeover: true },
-			}));
-			writeFileSync(join(projectDir, "claude-bridge.json"), JSON.stringify({
-				compaction: { takeover: false },
-				branchSummary: { takeover: false },
-			}));
-
-			const config = loadConfig(cwd);
-			assert.equal(config.compaction?.takeover, false);
-			assert.equal(config.branchSummary?.takeover, false);
-		} finally {
-			rmSync(cwd, { recursive: true, force: true });
-		}
-	}));
-
-	it("leaves the takeover flags independent of each other", () => withTempHome(() => {
-		const cwd = mkdtempSync(join(tmpdir(), "claude-bridge-project-"));
-		try {
-			const projectDir = join(cwd, CONFIG_DIR_NAME);
-			mkdirSync(projectDir, { recursive: true });
-			writeFileSync(join(projectDir, "claude-bridge.json"), JSON.stringify({
-				compaction: { takeover: false },
-			}));
-
-			const config = loadConfig(cwd);
-			assert.equal(config.compaction?.takeover, false);
-			assert.equal(config.branchSummary?.takeover, undefined);
-		} finally {
-			rmSync(cwd, { recursive: true, force: true });
-		}
-	}));
-
-	it("leaves both takeover flags undefined when unconfigured, so takeover stays on", () => withTempHome(() => {
-		const cwd = mkdtempSync(join(tmpdir(), "claude-bridge-project-"));
-		try {
-			const config = loadConfig(cwd);
-			assert.equal(config.compaction?.takeover, undefined);
-			assert.equal(config.branchSummary?.takeover, undefined);
 		} finally {
 			rmSync(cwd, { recursive: true, force: true });
 		}
@@ -161,6 +107,18 @@ describe("loadConfig", () => {
 		} finally {
 			rmSync(cwd, { recursive: true, force: true });
 		}
+	}));
+
+	it("markAskClaudeDeprecationNoticeShown records today's date without dropping settings", () => withTempHome(() => {
+		const globalDir = getAgentDir();
+		mkdirSync(globalDir, { recursive: true });
+		const path = join(globalDir, "claude-bridge.json");
+		writeFileSync(path, JSON.stringify({ askClaude: { enabled: true } }));
+
+		markAskClaudeDeprecationNoticeShown();
+		const written = JSON.parse(readFileSync(path, "utf-8"));
+		assert.match(written.askClaudeDeprecationShown, /^\d{4}-\d{2}-\d{2}$/);
+		assert.deepEqual(written.askClaude, { enabled: true });
 	}));
 
 	it("markStartupNoticeShown leaves an unparseable config untouched", () => withTempHome(() => {
@@ -197,10 +155,9 @@ describe("loadConfig", () => {
 
 			assert.deepEqual(loadConfig(cwd), {
 				startupNoticeShown: undefined,
+				askClaudeDeprecationShown: undefined,
 				provider: { plan: "max" },
 				askClaude: {},
-				compaction: {},
-				branchSummary: {},
 				webSearch: {},
 				cacheWarming: {},
 			});

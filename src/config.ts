@@ -11,6 +11,8 @@ import { dirname, join } from "path";
 export interface Config {
 	/** Date (YYYY-MM-DD) the one-time startup notice was shown. Written by the extension, not the user. */
 	startupNoticeShown?: string;
+	/** Date (YYYY-MM-DD) the AskClaude deprecation notice was shown. Written by the extension, not the user. */
+	askClaudeDeprecationShown?: string;
 	askClaude?: {
 		enabled?: boolean;
 		name?: string;
@@ -55,21 +57,6 @@ export interface Config {
 		// Model ids (e.g. "claude-future-9") whose declared 1M context Claude Code
 		// does not actually serve; pins them to the bare id at 200K.
 		forceTwoHundredK?: string[];
-	};
-	compaction?: {
-		// When true (default), the extension answers session_before_compact and
-		// runs pi's compact() through an isolated Claude Code subprocess (no
-		// tools, no skills, single turn). Set to false to stand down so native
-		// pi compaction or another extension owns the summary instead.
-		takeover?: boolean;
-	};
-	branchSummary?: {
-		// When true (default), the extension answers session_before_tree the same
-		// way. Set to false only when another extension owns branch summaries:
-		// unlike compaction, native fall-through cannot work on a bridge model,
-		// because pi's branch-summary prompt reaches the provider unrecorded and
-		// resolveOrDerive throws on it.
-		takeover?: boolean;
 	};
 	/**
 	 * Extension-owned prompt-cache warming. Pi's native warmer is capped at a
@@ -145,15 +132,34 @@ export function markStartupNoticeShown(): string {
 	return path;
 }
 
+/** Record when the AskClaude deprecation notice was shown in the global config, preserving every
+ *  other field. Returns the config path either way. */
+export function markAskClaudeDeprecationNoticeShown(): string {
+	const path = globalConfigPath();
+	let existing: Partial<Config> = {};
+	if (existsSync(path)) {
+		try {
+			existing = JSON.parse(readFileSync(path, "utf-8"));
+		} catch (e) {
+			console.error(`claude-bridge: leaving ${path} alone, it does not parse: ${e}`);
+			return path;
+		}
+	}
+	// Match startupNoticeShown's local YYYY-MM-DD date format.
+	const next = { ...existing, askClaudeDeprecationShown: new Date().toLocaleDateString("en-CA") };
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(path, `${JSON.stringify(next, null, 2)}\n`);
+	return path;
+}
+
 export function loadConfig(cwd: string): Config {
 	const global = tryParseJson(globalConfigPath());
 	const project = tryParseJson(join(cwd, CONFIG_DIR_NAME, "claude-bridge.json"));
 	return {
 		startupNoticeShown: project.startupNoticeShown ?? global.startupNoticeShown,
+		askClaudeDeprecationShown: project.askClaudeDeprecationShown ?? global.askClaudeDeprecationShown,
 		askClaude: { ...global.askClaude, ...project.askClaude },
 		provider: { ...global.provider, ...project.provider },
-		compaction: { ...global.compaction, ...project.compaction },
-		branchSummary: { ...global.branchSummary, ...project.branchSummary },
 		webSearch: { ...global.webSearch, ...project.webSearch },
 		cacheWarming: { ...global.cacheWarming, ...project.cacheWarming },
 	};
